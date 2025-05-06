@@ -13,16 +13,16 @@ from ax.service.utils.report_utils import exp_to_df
 from botorch.models.fully_bayesian import SaasFullyBayesianSingleTaskGP
 from ax.models.torch.botorch_modular.surrogate import Surrogate
 
-import evaluator
+import packer
 
 # --- Define search space ---
-N_BINS = 2
-K_SLOTS = 3
+N_BINS = 5
+K_SLOTS = 8
 
-GPU_TYPES = ["H200", "H20"]
-INVENTORY = {"H200": 32, "H20": 16}
+GPU_TYPES = ["DGX-B300", "H200", "H20"]
+INVENTORY = {"DGX-B300": 64, "H200": 64, "H20": 128}
 
-evaluatorSim = evaluator.Evaluator(
+pack = packer.Packer(
     inventory=INVENTORY,
     gpu_types=GPU_TYPES,
 )
@@ -34,13 +34,7 @@ for b in range(N_BINS):
     parameters.append(
         RangeParameter(
             name=f"prompt_max_{b}", parameter_type=ParameterType.INT,
-            lower=1, upper=2048,
-        )
-    )
-    parameters.append(
-        RangeParameter(
-            name=f"decode_max_{b}", parameter_type=ParameterType.INT,
-            lower=1, upper=2048,
+            lower=1, upper=8192,
         )
     )
 
@@ -52,21 +46,13 @@ for k in range(K_SLOTS):
             values=GPU_TYPES,
         ),
         RangeParameter(
-            name=f"size_{k}", parameter_type=ParameterType.INT,
-            lower=0, upper=16,
-        ),
-        RangeParameter(
             name=f"dp_{k}", parameter_type=ParameterType.INT,
             lower=1, upper=16,
         ),
         RangeParameter(
             name=f"tp_{k}", parameter_type=ParameterType.INT,
             lower=1, upper=16,
-        ),
-        ChoiceParameter(
-            name=f"role_{k}", parameter_type=ParameterType.STRING,
-            values=["prefill", "decode"],
-        ),
+        )
     ]
 
 search_space = SearchSpace(parameters=parameters)
@@ -78,7 +64,7 @@ def eval_config_outer(params):
     usage = {t: 0 for t in GPU_TYPES}
     for k in range(K_SLOTS):
         t = params[f"gpu_type_{k}"]
-        s = params[f"size_{k}"]
+        s = params[f"dp_{k}"] * params[f"tp_{k}"]
         # skip unused slots
         if s <= 0:
             continue
@@ -94,12 +80,13 @@ def eval_config_outer(params):
     for b in range(N_BINS):
         # extract bin parameters
         prompt_max = params[f"prompt_max_{b}"]
-        decode_max = params[f"decode_max_{b}"]
+        # decode_max = params[f"decode_max_{b}"]
         
         # create bin
-        bin = evaluator.Bin(
+        bin = packer.Bin(
             prompt_max=prompt_max,
-            decode_max=decode_max,
+            decode_max=1024,
+            role="prefill",
         )
 
         # add bin to the list
@@ -109,33 +96,29 @@ def eval_config_outer(params):
     for k in range(K_SLOTS):
         # extract island parameters
         gpu_type = params[f"gpu_type_{k}"]
-        size = params[f"size_{k}"]
         dp = params[f"dp_{k}"]
         tp = params[f"tp_{k}"]
-        role = params[f"role_{k}"]
 
         # skip unused slots
-        if size <= 0:
+        if dp <= 0 or tp <= 0:
             continue
 
         # create island
-        island = evaluator.Island(
+        island = packer.Island(
             gpu_type=gpu_type,
-            size=size,
+            role="prefill",
             dp=dp,
             tp=tp,
-            role=role,
         )
 
         # add island to the list
         slots.append(island)
 
     # evaluate configuration
-    rho_max = evaluatorSim.evaluate(bins, slots)
+    prefill_speed, prefill_config = pack.pack_prefill(bins, slots)
 
-    # if evaluation fails, return a large value
-    if rho_max is None:
-        return 1e6
+    # calculate rho_max
+    rho_max = 1 / prefill_speed
 
     return rho_max
 

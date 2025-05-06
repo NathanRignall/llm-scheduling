@@ -3,18 +3,6 @@ import math
 
 import simulator
 
-class Island:
-    def __init__(self, gpu_type, size, dp, tp, role):
-        self.gpu_type = gpu_type
-        self.size = size
-        self.dp = dp
-        self.tp = tp
-        self.role = role
-
-class Bin:
-    def __init__(self, prompt_max, decode_max):
-        self.prompt_max = prompt_max
-        self.decode_max = decode_max
 
 class Evaluator:
     def __init__(self, inventory, gpu_types):
