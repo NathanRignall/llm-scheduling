@@ -81,7 +81,7 @@ class Packer:
         for filtered_trace, bin in zip(filtered_traces, sorted_bins):
             if len(filtered_trace) == 0:
                 # No samples in this bin range, skip evaluation
-                continue
+                print(f"Bin {bin.prompt_max} has no samples in the trace.")
 
             # evaluate on the filtered trace
             for island in prefill_islands:
@@ -100,7 +100,8 @@ class Packer:
         # scale results to the number of samples (divide by the number of samples)
         for i in range(len(results)):
             bin, island, t, trace = results[i]
-            results[i] = (bin, island, t / len(trace), trace)          
+            avg_time = t / len(trace) if len(trace) > 0 else 0
+            results[i] = (bin, island, avg_time, trace)
             
         # Create a mapping of bins to islands
         configs = []
@@ -136,6 +137,7 @@ class Packer:
                         break
                 else:
                     print(f"Configuration not found for bin {bin} and island {island}")
+                    time = float('inf') 
                     continue
 
             if time < best_time and time > 0:
@@ -188,7 +190,7 @@ if __name__ == "__main__":
     packer = Packer(inventory, gpu_types)
 
     # Define bins and slots
-    bins = [Bin('prefill', 8000, 512), Bin('prefill', 8000, 1024)]
+    bins = [Bin('prefill', 2000, 512), Bin('prefill', 8000, 1024)]
     slots = [Island('prefill', 'H200', 1, 1), Island('prefill', 'DGX-B300', 1, 1)]
 
     # Pack the prefill bins
