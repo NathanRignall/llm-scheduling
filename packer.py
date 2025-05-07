@@ -155,7 +155,7 @@ class Packer:
                     print(f"Configuration not found for bin {bin} and island {island}")
                     continue
 
-            if time < best_time:
+            if time < best_time and time > 0:
                 best_time = time
                 best_config = config
 
@@ -172,7 +172,7 @@ class Packer:
             for island, bin in best_config.items():
                 print(f"  Island (gpu_type={island.gpu_type}, size={island.size}) "
                     f"-> Bin (prompt_max={bin.prompt_max}, decode_max={bin.decode_max})")
-                
+        
         return best_time, best_config
 
     def evaluate_prefill(self, bin, island, test_trace):

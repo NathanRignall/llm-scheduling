@@ -12,6 +12,7 @@ from ax.modelbridge.cross_validation import cross_validate, compute_diagnostics
 from ax.service.utils.report_utils import exp_to_df
 from botorch.models.fully_bayesian import SaasFullyBayesianSingleTaskGP
 from ax.models.torch.botorch_modular.surrogate import Surrogate
+import numpy as np
 
 import packer
 
@@ -47,11 +48,11 @@ for k in range(K_SLOTS):
         ),
         RangeParameter(
             name=f"dp_{k}", parameter_type=ParameterType.INT,
-            lower=1, upper=16,
+            lower=0, upper=16,
         ),
         RangeParameter(
             name=f"tp_{k}", parameter_type=ParameterType.INT,
-            lower=1, upper=16,
+            lower=0, upper=16,
         )
     ]
 
@@ -77,20 +78,18 @@ def eval_config_outer(params):
         
     # extract parameters
     bins = []
+    last_prompt_max = -1
     for b in range(N_BINS):
-        # extract bin parameters
         prompt_max = params[f"prompt_max_{b}"]
-        # decode_max = params[f"decode_max_{b}"]
-        
-        # create bin
-        bin = packer.Bin(
+        new_bin = packer.Bin(
             prompt_max=prompt_max,
             decode_max=1024,
             role="prefill",
         )
-
-        # add bin to the list
-        bins.append(bin)
+        # only append if this bin is larger than the last added
+        if not bins or prompt_max > last_prompt_max:
+            bins.append(new_bin)
+            last_prompt_max = prompt_max
 
     slots = []
     for k in range(K_SLOTS):
@@ -116,9 +115,8 @@ def eval_config_outer(params):
 
     # evaluate configuration
     prefill_speed, prefill_config = pack.pack_prefill(bins, slots)
-
     # calculate rho_max
-    rho_max = 1 / prefill_speed
+    rho_max = prefill_speed if prefill_speed != np.inf else 1e6
 
     return rho_max
 
