@@ -18,10 +18,10 @@ import packer
 
 # --- Define search space ---
 N_BINS = 5
-K_SLOTS = 8
+K_SLOTS = 5
 
-GPU_TYPES = ["DGX-B300", "H200", "H20"]
-INVENTORY = {"DGX-B300": 64, "H200": 64, "H20": 128}
+GPU_TYPES = ["DGX-B300", "H20"]
+INVENTORY = {"DGX-B300": 64, "H20": 128}
 
 pack = packer.Packer(
     inventory=INVENTORY,
@@ -61,6 +61,8 @@ search_space = SearchSpace(parameters=parameters)
 # --- Inner-loop evaluator ---
 def eval_config_outer(params):
 
+    print("\n\n***** Evaluating configuration *****")
+
     # Inventory constraint: count GPUs used per type
     usage = {t: 0 for t in GPU_TYPES}
     for k in range(K_SLOTS):
@@ -74,6 +76,7 @@ def eval_config_outer(params):
     # Reject configurations exceeding stock
     for t, used in usage.items():
         if used > INVENTORY[t]:
+            print(f"ERROR - Configuration rejected: {t} used {used} > {INVENTORY[t]} available")
             return 1e6
         
     # extract parameters
@@ -90,6 +93,18 @@ def eval_config_outer(params):
         if not bins or prompt_max > last_prompt_max:
             bins.append(new_bin)
             last_prompt_max = prompt_max
+            print(f"Bin {b} added: {prompt_max} > {last_prompt_max}")
+        else:
+            print(f"Bin {b} not added: {prompt_max} <= {last_prompt_max}")
+
+            # don't add any more bins (break loop
+            break
+
+    # print all bins in an array
+    print("Bins:")
+    for b in bins:
+        print(f"  {b.prompt_max}")
+    print("")
 
     slots = []
     for k in range(K_SLOTS):
@@ -100,7 +115,9 @@ def eval_config_outer(params):
 
         # skip unused slots
         if dp <= 0 or tp <= 0:
+            print(f"Slot {k} not used: dp={dp}, tp={tp}")
             continue
+        print(f"Slot {k} used: gpu_type={gpu_type}, dp={dp}, tp={tp}")
 
         # create island
         island = packer.Island(
@@ -113,10 +130,23 @@ def eval_config_outer(params):
         # add island to the list
         slots.append(island)
 
+    # print all slots in an array
+    print("Slots:")
+    for s in slots:
+        print(f"  gpu_type={s.gpu_type}, dp={s.dp}, tp={s.tp}")
+    print("")
+
+    # error if more bins than slots
+    if len(bins) > len(slots):
+        print(f"ERROR - Configuration rejected: {len(bins)} bins > {len(slots)} slots")
+        return 1e6
+
     # evaluate configuration
-    prefill_speed, prefill_config = pack.pack_prefill(bins, slots)
+    prefill_speed, _, _, _ = pack.pack_prefill(bins, slots, 10000)
     # calculate rho_max
     rho_max = prefill_speed if prefill_speed != np.inf else 1e6
+
+    print(f"***** rho_max = {rho_max:.2f} *****")
 
     return rho_max
 
@@ -180,6 +210,9 @@ for i in range(N_BATCH):
 
     # Update data
     new_data = trial.fetch_data()
+    for _, row in new_data.df.iterrows():
+        print(f"Iteration {i+1}, arm {row['arm_name']}: rho_max = {row['mean']}")
+
     data = Data.from_multiple_data([data, new_data])
 
     # Diagnostics

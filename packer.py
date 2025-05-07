@@ -9,9 +9,9 @@ def generate_trace(num_samples):
     prompt_lengths = np.random.normal(loc=2048, scale=1024, size=num_samples)
     decode_lengths = np.random.normal(loc=512, scale=128, size=num_samples)
 
-    # Convert to whole numbers and clip to minimum of 1
-    prompt_lengths = np.clip(prompt_lengths.astype(int), 1, None)
-    decode_lengths = np.clip(decode_lengths.astype(int), 1, None)
+    # Convert to whole numbers and drop negative values
+    prompt_lengths = np.clip(prompt_lengths, 0, None).astype(int)
+    decode_lengths = np.clip(decode_lengths, 0, None).astype(int)
 
     # Create tuples
     test_trace = list(zip(prompt_lengths, decode_lengths))
@@ -42,9 +42,9 @@ class Packer:
         self.args = simulator.ModelArgs()
         self.gpu_list = simulator.get_gpu_info('./device/gpu_info.csv', decoding_mode=True, device_list=gpu_types, discount_rate=0.85)
 
-    def pack_prefill(self, bins, islands, print_debug=False):
+    def pack_prefill(self, bins, islands, num_samples, print_debug=False):
         # Generate a test trace
-        test_trace = generate_trace(num_samples=1000)
+        test_trace = generate_trace(num_samples)
 
         # extract the prefill bins and islands
         prefill_bins = [bin for bin in bins if bin.role == 'prefill']
@@ -73,29 +73,7 @@ class Packer:
                 for prompt_length, decode_length in test_trace
                 if prev_prefill < prompt_length <= upper_prefill
             ]
-            print(f"Bin {idx + 1}: {bin.prompt_max} ({prev_prefill}, {upper_prefill})")
-            for item in filtered_trace:
-                sequence_length = item[0]
-                print(f"Filtered trace: {sequence_length}")
-
             filtered_traces.append(filtered_trace)
-
-        #plot the filtered traces as a histogram, different colors each element
-        # import matplotlib.pyplot as plt
-        # plt.figure(figsize=(10, 6))
-        # for i, filtered_trace in enumerate(filtered_traces):
-        #     if len(filtered_trace) == 0:
-        #         # No samples in this bin range, skip plotting
-        #         continue
-        #     # Extract prompt lengths for the histogram
-        #     prompt_lengths = [prompt_length for prompt_length, _ in filtered_trace]
-        #     # Plot the histogram
-        #     plt.hist(prompt_lengths, bins=20, alpha=0.5, label=f'Bin {i+1}')
-        # plt.xlabel('Prompt Length')
-        # plt.ylabel('Frequency')
-        # plt.title('Filtered Traces Histogram')
-        # plt.legend()
-        # plt.show()
 
         # Store the results of every test
         results = []
@@ -118,6 +96,11 @@ class Packer:
                     f"on Isl(gpu={island.gpu_type}, size={island.size}): {t:.2f} "
                     f"for {len(trace)} samples"
                 )
+
+        # scale results to the number of samples (divide by the number of samples)
+        for i in range(len(results)):
+            bin, island, t, trace = results[i]
+            results[i] = (bin, island, t / len(trace), trace)          
             
         # Create a mapping of bins to islands
         configs = []
@@ -173,7 +156,7 @@ class Packer:
                 print(f"  Island (gpu_type={island.gpu_type}, size={island.size}) "
                     f"-> Bin (prompt_max={bin.prompt_max}, decode_max={bin.decode_max})")
         
-        return best_time, best_config
+        return best_time, best_config, filtered_traces, results
 
     def evaluate_prefill(self, bin, island, test_trace):
         # Simulate the prefill time for each trace and calculate the average
@@ -197,22 +180,42 @@ if __name__ == "__main__":
     # Define the inventory and GPU types
     inventory = {
         'H200': 32,
-        'H800': 16,
+        'DGX-B300': 16,
     }
-    gpu_types = ['H200', 'H800']
+    gpu_types = ['H200', 'DGX-B300']
 
     # Create a packer instance
     packer = Packer(inventory, gpu_types)
 
     # Define bins and slots
-    bins = [Bin('prefill', 1024, 0), Bin('prefill', 2048, 0)]
-    slots = [Island('prefill', 'H200', 8, 1), Island('prefill', 'H200', 8, 1)]
+    bins = [Bin('prefill', 8000, 512), Bin('prefill', 8000, 1024)]
+    slots = [Island('prefill', 'H200', 1, 1), Island('prefill', 'DGX-B300', 1, 1)]
 
     # Pack the prefill bins
-    prefill_speed, prefill_config = packer.pack_prefill(bins, slots, print_debug=True)
+    prefill_speed, prefill_config, filtered_traces, results = packer.pack_prefill(bins, slots, 10000, print_debug=True)
 
     print(f"Prefill speed: {prefill_speed:.2f}")
     print("Prefill configuration:")
     for island, bin in prefill_config.items():
         print(f"  Island (gpu_type={island.gpu_type}, size={island.size}) "
             f"-> Bin (prompt_max={bin.prompt_max}, decode_max={bin.decode_max})")
+        
+
+    # plot the filtered traces as a histogram
+    import matplotlib.pyplot as plt
+
+    plt.figure(figsize=(10, 6))
+    for i, filtered_trace in enumerate(filtered_traces):
+        if not filtered_trace:
+            continue
+        # Extract prompt lengths
+        prompt_lengths = [p for p, _ in filtered_trace]
+        # Compute bin edges with width 32
+        min_len, max_len = min(prompt_lengths), max(prompt_lengths)
+        bins = np.arange(min_len, max_len + 32, 32)
+        plt.hist(prompt_lengths, bins=bins, alpha=0.5, label=f'Bin {i+1}')
+    plt.xlabel('Prompt Length')
+    plt.ylabel('Frequency')
+    plt.title('Filtered Traces Histogram (bin width = 10)')
+    plt.legend()
+    plt.show()
