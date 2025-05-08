@@ -85,7 +85,7 @@ class Packer:
 
             # evaluate on the filtered trace
             for island in prefill_islands:
-                avg_time = self.evaluate_prefill(bin, island, filtered_trace)
+                avg_time = self.evaluate_prefill(island, filtered_trace)
                 results.append((bin, island, avg_time, filtered_trace))
 
         # debug‐print the results
@@ -97,11 +97,11 @@ class Packer:
                     f"for {len(trace)} samples"
                 )
 
-        # scale results to the number of samples (divide by the number of samples)
-        for i in range(len(results)):
-            bin, island, t, trace = results[i]
-            avg_time = t / len(trace) if len(trace) > 0 else 0
-            results[i] = (bin, island, avg_time, trace)
+        # # scale results to the number of samples (divide by the number of samples)
+        # for i in range(len(results)):
+        #     bin, island, t, trace = results[i]
+        #     avg_time = t / len(trace) if len(trace) > 0 else 0
+        #     results[i] = (bin, island, avg_time, trace)
             
         # Create a mapping of bins to islands
         configs = []
@@ -160,11 +160,15 @@ class Packer:
         
         return best_time, best_config, filtered_traces, results
 
-    def evaluate_prefill(self, bin, island, test_trace):
+    def evaluate_prefill(self, island, test_trace):
+        # count the frequency of each prompt length
+        prompt_lengths = [prompt_length for prompt_length, _ in test_trace]
+        prompt_length_counts = {length: prompt_lengths.count(length) for length in set(prompt_lengths)}
+
         # Simulate the prefill time for each trace and calculate the average
         total_time = 0
         for prompt_length, _ in test_trace:
-            total_time += simulator.prefill_time(
+            time = simulator.prefill_time(
                 self.args,
                 self.gpu_list[island.gpu_type],
                 prompt_length,
@@ -172,6 +176,10 @@ class Packer:
                 tp_num=island.tp,
                 dp_num=island.dp
             )
+
+            # scale the time by the frequency of the prompt length
+            frequency = prompt_length_counts[prompt_length]
+            total_time += time * frequency
 
         # Return the average prefill time
         average_time = total_time 

@@ -17,8 +17,8 @@ import numpy as np
 import packer
 
 # --- Define search space ---
-N_BINS = 5
-K_SLOTS = 5
+N_BINS = 4
+K_SLOTS = 4
 
 GPU_TYPES = ["DGX-B300", "H20"]
 INVENTORY = {"DGX-B300": 64, "H20": 128}
@@ -74,10 +74,12 @@ def eval_config_outer(params):
         usage[t] += s
 
     # Reject configurations exceeding stock
+    percent_used = {t: 100 * used / INVENTORY[t] for t, used in usage.items()}
+    print(f"GPU usage: {percent_used}")
     for t, used in usage.items():
         if used > INVENTORY[t]:
             print(f"ERROR - Configuration rejected: {t} used {used} > {INVENTORY[t]} available")
-            return 1e6
+            return 1e9
         
     # extract parameters
     bins = []
@@ -139,12 +141,12 @@ def eval_config_outer(params):
     # error if more bins than slots
     if len(bins) > len(slots):
         print(f"ERROR - Configuration rejected: {len(bins)} bins > {len(slots)} slots")
-        return 1e6
+        return 1e9
 
     # evaluate configuration
     prefill_speed, _, _, _ = pack.pack_prefill(bins, slots, 10000)
     # calculate rho_max
-    rho_max = prefill_speed if prefill_speed != np.inf else 1e6
+    rho_max = prefill_speed if prefill_speed != np.inf else 1e9
 
     print(f"***** rho_max = {rho_max:.2f} *****")
 
