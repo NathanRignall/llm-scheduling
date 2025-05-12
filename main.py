@@ -1,17 +1,13 @@
 from ax import Data, OrderConstraint, SumConstraint
 from ax.core.experiment import Experiment
 from ax.core.search_space import SearchSpace
-from ax.core.parameter import ParameterType, ChoiceParameter, RangeParameter
-from ax.core.metric import Metric
+from ax.core.parameter import ParameterType, RangeParameter
 from ax.core.objective import Objective
 from ax.core.optimization_config import OptimizationConfig
 from ax.metrics.noisy_function import GenericNoisyFunctionMetric
 from ax.runners.synthetic import SyntheticRunner
 from ax.modelbridge.registry import Models
-from ax.modelbridge.cross_validation import cross_validate, compute_diagnostics
 from ax.service.utils.report_utils import exp_to_df
-from botorch.models.fully_bayesian import SaasFullyBayesianSingleTaskGP
-from ax.models.torch.botorch_modular.surrogate import Surrogate
 import numpy as np
 
 import packer
@@ -20,10 +16,9 @@ import packer
 K_SLOTS = 4
 
 GPU_TYPES = ["DGX-B300", "H20"]
-INVENTORY = {"DGX-B300": 64, "H20": 128}
+INVENTORY = {"DGX-B300": 32, "H20": 64}
 
 pack = packer.Packer(
-    inventory=INVENTORY,
     gpu_types=GPU_TYPES,
 )
 
@@ -42,7 +37,6 @@ for gpu_type in GPU_TYPES:
             name=f"count_{gpu_type}_{k}", parameter_type=ParameterType.INT,
             lower=0, upper=INVENTORY[gpu_type] / 4,
         )
-
         # GPU TP
         gpu_tp = RangeParameter(
             name=f"tp_{gpu_type}_{k}", parameter_type=ParameterType.INT,
@@ -56,7 +50,7 @@ for gpu_type in GPU_TYPES:
                 upper_parameter=gpu_count,
             )
         ]
-
+        
         # Add parameters to search space
         parameters.append(gpu_count)
         parameters.append(gpu_tp)
@@ -94,20 +88,20 @@ def eval_config_outer(params):
     slots = []
     for gpu_type in GPU_TYPES:
         for k in range(K_SLOTS):
-            # extract island parameters
+            # Extract island parameters
             count = params[f"count_{gpu_type}_{k}"]
             tp = params[f"tp_{gpu_type}_{k}"]
 
-            # calculate dp (count / tp, whole number)
+            # Calculate dp (count / tp, whole number)
             dp = count // tp if tp > 0 else 0
 
-            # skip unused slots
+            # Skip unused slots
             if count <= 0 or tp <= 0 or dp <= 0:
                 print(f"Slot {k} not used: gpu_type={gpu_type}, count={count}, tp={tp}, dp={dp}")
                 continue
             print(f"Slot {k} used: gpu_type={gpu_type}, count={count}, tp={tp}, dp={dp}")
 
-            # create island
+            # Create island
             island = packer.Island(
                 id=f"{gpu_type}_{k}",
                 gpu_type=gpu_type,
@@ -116,18 +110,11 @@ def eval_config_outer(params):
                 tp=tp,
             )
 
-            # add island to the list
+            # Add island to the list
             slots.append(island)
 
-    # print all slots in an array
-    print("Slots:")
-    for s in slots:
-        print(f"  gpu_type={s.gpu_type}, dp={s.dp}, tp={s.tp}")
-    print("")
-
-    # evaluate configuration
+    # Evaluate configuration
     prefill_speed = pack.solve_prefill(slots, 1000)
-    # calculate rho_max
     rho_max = prefill_speed if prefill_speed != np.inf else 1e9
 
     print(f"***** rho_max = {rho_max:.2f} *****")
@@ -156,7 +143,7 @@ experiment = Experiment(
 )
 
 # --- Initialization ---
-N_INIT = 20
+N_INIT = 10
 
 def initialize_experiment(exp, n_init):
     sobol = Models.SOBOL(search_space=exp.search_space)
@@ -168,10 +155,8 @@ def initialize_experiment(exp, n_init):
 data = initialize_experiment(experiment, N_INIT)
 
 # --- SAASBO loop ---
-BATCH_SIZE = 4
-# NUM_SAMPLES = 256
-# WARMUP_STEPS = 512
-N_BATCH = 10
+BATCH_SIZE = 3
+N_BATCH = 4
 
 for i in range(N_BATCH):
     # Build SAAS surrogate with NUTS
@@ -189,13 +174,14 @@ for i in range(N_BATCH):
 
     data = Data.from_multiple_data([data, new_data])
 
-    # Diagnostics
-    exp_df = exp_to_df(experiment)
-    print(f"Iteration {i+1}/{N_BATCH} completed; total trials: {len(exp_df['trial_index'].unique())}")
-    
-    # Check for convergence
-    new_value = trial.fetch_data().df["mean"].min()
-    print(f"Iteration: {i}, Best in iteration {new_value:.3f}, Best so far: {data.df['mean'].min():.3f}")
+    # Print intermediate results
+    print("\nIntermediate results:")
+    print(data.df[["arm_name", "mean"]].sort_values(by="mean"))
+    print("\n")
+
+    # Print best roh
+    best = data.df.loc[data.df["mean"].idxmin()]
+    print(f"Best rho_max: {best['mean']} for arm {best['arm_name']}")
 
 # --- Final results ---
 df = exp_to_df(experiment).sort_values(by=["trial_index"])
