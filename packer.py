@@ -50,6 +50,7 @@ class Packer:
         prefill_bins = [bin for bin in bins if bin.role == 'prefill']
         prefill_islands = [island for island in islands if island.role == 'prefill']
 
+        # Debug print start
         if print_debug:
             print(f"Packing {len(prefill_bins)} prefill bins onto {len(prefill_islands)} prefill islands...")
 
@@ -61,10 +62,8 @@ class Packer:
         filtered_traces = []
 
         for idx, bin in enumerate(sorted_bins):
-            # lower bounds
+            # calculate the bounds for the current bin
             prev_prefill = sorted_bins[idx - 1].prompt_max if idx > 0 else 0
-
-            # upper bounds
             upper_prefill = bin.prompt_max if idx < n - 1 else float('inf')
 
             # filter the test trace to only include samples within the bounds
@@ -102,18 +101,23 @@ class Packer:
         #     bin, island, t, trace = results[i]
         #     avg_time = t / len(trace) if len(trace) > 0 else 0
         #     results[i] = (bin, island, avg_time, trace)
-            
-        # Create a mapping of bins to islands
+
+        # generate all possible configurations to pack the bins
         configs = []
-        for perm in itertools.permutations(prefill_bins, len(prefill_islands)):
-            mapping = dict(zip(prefill_islands, perm))
-            configs.append(mapping) 
+
+        for perm in itertools.permutations(prefill_islands, r=len(prefill_bins)):
+            mapping = dict(zip(bins, perm))
+            configs.append(mapping)
+
+        if len(configs) == 0:
+            print("ERROR - No valid configurations found.")
+            return None, None, filtered_traces, results
 
         # Print the configurations for debugging
         if print_debug:
             for config in configs:
                 print("Configuration:")
-                for island, bin in config.items():
+                for bin, island in config.items():
                     print(f"  Island (gpu_type={island.gpu_type}, size={island.size}) "
                         f"-> Bin (prompt_max={bin.prompt_max}, decode_max={bin.decode_max})")
    
@@ -127,7 +131,7 @@ class Packer:
             time = 0
 
             # use the result 
-            for island, bin in config.items():
+            for bin, island in config.items():
                 # look up the result
                 for b, i, result, t in results:
                     if b == bin and i == island:
@@ -138,7 +142,8 @@ class Packer:
                 else:
                     print(f"Configuration not found for bin {bin} and island {island}")
                     time = float('inf') 
-                    continue
+                    # continue
+                    # throw an error
 
             if time < best_time and time > 0:
                 best_time = time
@@ -147,16 +152,19 @@ class Packer:
             if print_debug:
                 print(f"Configuration time: {time:.2f}")
                 print("Configuration:")
-                for island, bin in config.items():
+                for bin, island in config.items():
                     print(f"  Island (gpu_type={island.gpu_type}, size={island.size}) "
                         f"-> Bin (prompt_max={bin.prompt_max}, decode_max={bin.decode_max})")
 
         if print_debug:
             print(f"\nBest configuration speed: {best_time:.2f}")
             print("Best configuration:")
-            for island, bin in best_config.items():
+            for bin, island in best_config.items():
                 print(f"  Island (gpu_type={island.gpu_type}, size={island.size}) "
                     f"-> Bin (prompt_max={bin.prompt_max}, decode_max={bin.decode_max})")
+                
+        if best_time == float('inf'):
+            print("No valid configuration found.")
         
         return best_time, best_config, filtered_traces, results
 
@@ -198,15 +206,15 @@ if __name__ == "__main__":
     packer = Packer(inventory, gpu_types)
 
     # Define bins and slots
-    bins = [Bin('prefill', 2000, 512), Bin('prefill', 8000, 1024)]
-    slots = [Island('prefill', 'H200', 1, 1), Island('prefill', 'DGX-B300', 1, 1)]
+    bins = [Bin('prefill', 6096, 512)]
+    slots = [Island('prefill', 'DGX-B300', dp=1, tp=4), Island('prefill', 'DGX-B300', tp=2, dp=2)]
 
     # Pack the prefill bins
     prefill_speed, prefill_config, filtered_traces, results = packer.pack_prefill(bins, slots, 10000, print_debug=True)
 
     print(f"Prefill speed: {prefill_speed:.2f}")
     print("Prefill configuration:")
-    for island, bin in prefill_config.items():
+    for bin, island in prefill_config.items():
         print(f"  Island (gpu_type={island.gpu_type}, size={island.size}) "
             f"-> Bin (prompt_max={bin.prompt_max}, decode_max={bin.decode_max})")
         

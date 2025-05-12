@@ -1,4 +1,4 @@
-from ax import Data
+from ax import Data, OrderConstraint, SumConstraint
 from ax.core.experiment import Experiment
 from ax.core.search_space import SearchSpace
 from ax.core.parameter import ParameterType, ChoiceParameter, RangeParameter
@@ -29,6 +29,7 @@ pack = packer.Packer(
 )
 
 parameters = []
+parameter_constraints = []
 
 # Bin boundaries
 for b in range(N_BINS):
@@ -40,23 +41,49 @@ for b in range(N_BINS):
     )
 
 # Island slots
-for k in range(K_SLOTS):
-    parameters += [
-        ChoiceParameter(
-            name=f"gpu_type_{k}", parameter_type=ParameterType.STRING,
-            values=GPU_TYPES,
-        ),
-        RangeParameter(
-            name=f"dp_{k}", parameter_type=ParameterType.INT,
-            lower=0, upper=16,
-        ),
-        RangeParameter(
-            name=f"tp_{k}", parameter_type=ParameterType.INT,
-            lower=0, upper=16,
+for gpu_type in GPU_TYPES:
+    # GPU Sum
+    gpu_sum = []
+
+    # For each GPU type, create K_SLOTS
+    for k in range(K_SLOTS):
+        # GPU Count
+        gpu_count = RangeParameter(
+            name=f"count_{gpu_type}_{k}", parameter_type=ParameterType.INT,
+            lower=0, upper=INVENTORY[gpu_type],
         )
+
+        # GPU TP
+        gpu_tp = RangeParameter(
+            name=f"tp_{gpu_type}_{k}", parameter_type=ParameterType.INT,
+            lower=1, upper=4,
+        )
+
+        # Limit TP to count
+        parameter_constraints += [
+            OrderConstraint(
+                lower_parameter=gpu_tp,
+                upper_parameter=gpu_count,
+            )
+        ]
+
+        # Add parameters to search space
+        parameters.append(gpu_count)
+        parameters.append(gpu_tp)
+
+        # Add to sum
+        gpu_sum.append(gpu_count)
+
+    # Constrain GPU count per type to inventory
+    parameter_constraints += [
+        SumConstraint(
+            parameters=gpu_sum,
+            is_upper_bound=True,
+            bound=INVENTORY[gpu_type],
+        ),
     ]
 
-search_space = SearchSpace(parameters=parameters)
+search_space = SearchSpace(parameters=parameters, parameter_constraints=parameter_constraints)
 
 # --- Inner-loop evaluator ---
 def eval_config_outer(params):
@@ -64,21 +91,14 @@ def eval_config_outer(params):
     print("\n\n***** Evaluating configuration *****")
 
     # Inventory constraint: count GPUs used per type
-    usage = {t: 0 for t in GPU_TYPES}
-    for k in range(K_SLOTS):
-        t = params[f"gpu_type_{k}"]
-        s = params[f"dp_{k}"] * params[f"tp_{k}"]
-        # skip unused slots
-        if s <= 0:
-            continue
-        usage[t] += s
-
-    # Reject configurations exceeding stock
-    percent_used = {t: 100 * used / INVENTORY[t] for t, used in usage.items()}
-    print(f"GPU usage: {percent_used}")
-    for t, used in usage.items():
-        if used > INVENTORY[t]:
-            print(f"ERROR - Configuration rejected: {t} used {used} > {INVENTORY[t]} available")
+    for gpu_type in GPU_TYPES:
+        total_count = 0
+        for k in range(K_SLOTS):
+            total_count += params[f"count_{gpu_type}_{k}"]
+        percent_used = 100 * total_count / INVENTORY[gpu_type]
+        print(f"GPU usage: {gpu_type} {percent_used:.2f}%")
+        if total_count > INVENTORY[gpu_type]:
+            print(f"ERROR - Configuration rejected: {gpu_type} used {total_count} > {INVENTORY[gpu_type]} available")
             return 1e9
         
     # extract parameters
@@ -98,8 +118,7 @@ def eval_config_outer(params):
             print(f"Bin {b} added: {prompt_max} > {last_prompt_max}")
         else:
             print(f"Bin {b} not added: {prompt_max} <= {last_prompt_max}")
-
-            # don't add any more bins (break loop
+            # don't add any more bins
             break
 
     # print all bins in an array
@@ -109,28 +128,31 @@ def eval_config_outer(params):
     print("")
 
     slots = []
-    for k in range(K_SLOTS):
-        # extract island parameters
-        gpu_type = params[f"gpu_type_{k}"]
-        dp = params[f"dp_{k}"]
-        tp = params[f"tp_{k}"]
+    for gpu_type in GPU_TYPES:
+        for k in range(K_SLOTS):
+            # extract island parameters
+            count = params[f"count_{gpu_type}_{k}"]
+            tp = params[f"tp_{gpu_type}_{k}"]
 
-        # skip unused slots
-        if dp <= 0 or tp <= 0:
-            print(f"Slot {k} not used: dp={dp}, tp={tp}")
-            continue
-        print(f"Slot {k} used: gpu_type={gpu_type}, dp={dp}, tp={tp}")
+            # calculate dp (count / tp, whole number)
+            dp = count // tp if tp > 0 else 0
 
-        # create island
-        island = packer.Island(
-            gpu_type=gpu_type,
-            role="prefill",
-            dp=dp,
-            tp=tp,
-        )
+            # skip unused slots
+            if count <= 0 or tp <= 0 or dp <= 0:
+                print(f"Slot {k} not used: gpu_type={gpu_type}, count={count}, tp={tp}, dp={dp}")
+                continue
+            print(f"Slot {k} used: gpu_type={gpu_type}, count={count}, tp={tp}, dp={dp}")
 
-        # add island to the list
-        slots.append(island)
+            # create island
+            island = packer.Island(
+                gpu_type=gpu_type,
+                role="prefill",
+                dp=dp,
+                tp=tp,
+            )
+
+            # add island to the list
+            slots.append(island)
 
     # print all slots in an array
     print("Slots:")
@@ -144,7 +166,7 @@ def eval_config_outer(params):
         return 1e9
 
     # evaluate configuration
-    prefill_speed, _, _, _ = pack.pack_prefill(bins, slots, 10000)
+    prefill_speed, _, _, _ = pack.pack_prefill(bins, slots, 1000)
     # calculate rho_max
     rho_max = prefill_speed if prefill_speed != np.inf else 1e9
 
@@ -152,17 +174,17 @@ def eval_config_outer(params):
 
     return rho_max
 
-# --- Define metric ---
-metric = GenericNoisyFunctionMetric(
-    name="rho_max",
-    f=lambda param_dict: eval_config_outer(param_dict),
-    noise_sd=0.0,
-    lower_is_better=True,
-)
-
 # --- Optimization config ---
 optimization_config = OptimizationConfig(
-    objective=Objective(metric=metric, minimize=True)
+    objective=Objective(
+        metric=GenericNoisyFunctionMetric(
+                name="rho_max",
+                f=lambda param_dict: eval_config_outer(param_dict),
+                noise_sd=1e-4,
+                lower_is_better=True,
+        ),
+        minimize=True,
+    )
 )
 
 # --- Build experiment ---
@@ -170,7 +192,7 @@ experiment = Experiment(
     name="gpu_island_scheduler",
     search_space=search_space,
     optimization_config=optimization_config,
-    runner=SyntheticRunner(),  # runs metric.f directly
+    runner=SyntheticRunner(),
 )
 
 # --- Initialization ---
@@ -187,23 +209,13 @@ data = initialize_experiment(experiment, N_INIT)
 
 # --- SAASBO loop ---
 BATCH_SIZE = 4
-NUM_SAMPLES = 128
-WARMUP_STEPS = 256
+# NUM_SAMPLES = 256
+# WARMUP_STEPS = 512
 N_BATCH = 10
 
 for i in range(N_BATCH):
     # Build SAAS surrogate with NUTS
-    model = Models.BOTORCH_MODULAR(
-        experiment=experiment,
-        data=data,
-        surrogate=Surrogate(
-            botorch_model_class=SaasFullyBayesianSingleTaskGP,
-            mll_options={
-                "num_samples": NUM_SAMPLES,
-                "warmup_steps": WARMUP_STEPS,
-            },
-        ),
-    )
+    model = Models.SAASBO(experiment=experiment, data=data)
 
     # Generate next candidates with SAASBO
     generator_run = model.gen(BATCH_SIZE)
@@ -220,6 +232,10 @@ for i in range(N_BATCH):
     # Diagnostics
     exp_df = exp_to_df(experiment)
     print(f"Iteration {i+1}/{N_BATCH} completed; total trials: {len(exp_df['trial_index'].unique())}")
+    
+    # Check for convergence
+    new_value = trial.fetch_data().df["mean"].min()
+    print(f"Iteration: {i}, Best in iteration {new_value:.3f}, Best so far: {data.df['mean'].min():.3f}")
 
 # --- Final results ---
 df = exp_to_df(experiment).sort_values(by=["trial_index"])
