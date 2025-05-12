@@ -1,13 +1,19 @@
-from ax import Data, OrderConstraint, SumConstraint
+from ax import Arm, Data, OrderConstraint, SumConstraint
 from ax.core.experiment import Experiment
 from ax.core.search_space import SearchSpace
-from ax.core.parameter import ParameterType, RangeParameter
+from ax.core.parameter import ParameterType, ChoiceParameter, RangeParameter
+from ax.core.metric import Metric
 from ax.core.objective import Objective
 from ax.core.optimization_config import OptimizationConfig
 from ax.metrics.noisy_function import GenericNoisyFunctionMetric
 from ax.runners.synthetic import SyntheticRunner
 from ax.modelbridge.registry import Models
+from ax.modelbridge.cross_validation import cross_validate, compute_diagnostics
 from ax.service.utils.report_utils import exp_to_df
+from botorch.models.fully_bayesian import SaasFullyBayesianSingleTaskGP
+from ax.models.torch.botorch_modular.surrogate import Surrogate
+import numpy as np
+
 import numpy as np
 
 import packer
@@ -35,7 +41,7 @@ for gpu_type in GPU_TYPES:
         # GPU Count
         gpu_count = RangeParameter(
             name=f"count_{gpu_type}_{k}", parameter_type=ParameterType.INT,
-            lower=0, upper=INVENTORY[gpu_type] / 4,
+            lower=0, upper=INVENTORY[gpu_type],
         )
         # GPU TP
         gpu_tp = RangeParameter(
@@ -103,7 +109,6 @@ def eval_config_outer(params):
 
             # Create island
             island = packer.Island(
-                id=f"{gpu_type}_{k}",
                 gpu_type=gpu_type,
                 role="prefill",
                 dp=dp,
@@ -143,24 +148,66 @@ experiment = Experiment(
 )
 
 # --- Initialization ---
-N_INIT = 10
+def generate_okay_configs(n_configs: int = 1):
+    configs = []
+    for _ in range(n_configs):
+        cfg = {}
+        # For each GPU type, track how many we've allocated so we don't exceed INVENTORY[gpu_type]
+        for gpu_type in GPU_TYPES:
+            total_used = 0
+            for k in range(K_SLOTS):
+                # Remaining budget for this gpu_type
+                remaining = INVENTORY[gpu_type] - total_used
+                # Randomly pick count in [0, remaining]
+                count = np.random.randint(0, remaining + 1)
+                # Pick a tp in [1, 4], but cap it to 'count'
+                tp = np.random.randint(1, 4)
+                tp = min(tp, count) if count > 0 else 0
 
-def initialize_experiment(exp, n_init):
-    sobol = Models.SOBOL(search_space=exp.search_space)
-    batch = sobol.gen(n_init)
-    trial = exp.new_batch_trial(generator_run=batch)
-    trial.run()
-    return exp.fetch_data()
+                cfg[f"count_{gpu_type}_{k}"] = count
+                cfg[f"tp_{gpu_type}_{k}"] = tp
 
-data = initialize_experiment(experiment, N_INIT)
+                total_used += count
+
+        print(f"Initial configuration: {cfg}")
+        configs.append(cfg)
+    return configs
+
+# Generate, for example, 3 warm‐start configurations
+initial_parameters = generate_okay_configs(n_configs=1)
+
+def add_initial_arms(experiment, initial_parameters):
+    for idx, params in enumerate(initial_parameters):
+        arm = Arm(name=f"warm_start_{idx}", parameters=params)
+        trial = experiment.new_trial()
+        trial.add_arm(arm)
+        trial.run()
+
+# Invoke the warm-start function
+add_initial_arms(experiment, initial_parameters)
+
+# Fetch data from the experiment
+data = experiment.fetch_data()
 
 # --- SAASBO loop ---
-BATCH_SIZE = 3
-N_BATCH = 4
+BATCH_SIZE = 5
+NUM_SAMPLES = 256
+WARMUP_STEPS = 512
+N_BATCH = 10
 
 for i in range(N_BATCH):
     # Build SAAS surrogate with NUTS
-    model = Models.SAASBO(experiment=experiment, data=data)
+    model = Models.BOTORCH_MODULAR(
+        experiment=experiment,
+        data=data,
+        surrogate=Surrogate(
+            botorch_model_class=SaasFullyBayesianSingleTaskGP,
+            mll_options={
+                "num_samples": NUM_SAMPLES,
+                "warmup_steps": WARMUP_STEPS,
+            },
+        ),
+    )
 
     # Generate next candidates with SAASBO
     generator_run = model.gen(BATCH_SIZE)
