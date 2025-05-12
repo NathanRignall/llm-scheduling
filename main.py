@@ -17,7 +17,6 @@ import numpy as np
 import packer
 
 # --- Define search space ---
-N_BINS = 4
 K_SLOTS = 4
 
 GPU_TYPES = ["DGX-B300", "H20"]
@@ -31,15 +30,6 @@ pack = packer.Packer(
 parameters = []
 parameter_constraints = []
 
-# Bin boundaries
-for b in range(N_BINS):
-    parameters.append(
-        RangeParameter(
-            name=f"prompt_max_{b}", parameter_type=ParameterType.INT,
-            lower=1, upper=8192,
-        )
-    )
-
 # Island slots
 for gpu_type in GPU_TYPES:
     # GPU Sum
@@ -50,7 +40,7 @@ for gpu_type in GPU_TYPES:
         # GPU Count
         gpu_count = RangeParameter(
             name=f"count_{gpu_type}_{k}", parameter_type=ParameterType.INT,
-            lower=0, upper=INVENTORY[gpu_type],
+            lower=0, upper=INVENTORY[gpu_type] / 4,
         )
 
         # GPU TP
@@ -100,32 +90,6 @@ def eval_config_outer(params):
         if total_count > INVENTORY[gpu_type]:
             print(f"ERROR - Configuration rejected: {gpu_type} used {total_count} > {INVENTORY[gpu_type]} available")
             return 1e9
-        
-    # extract parameters
-    bins = []
-    last_prompt_max = -1
-    for b in range(N_BINS):
-        prompt_max = params[f"prompt_max_{b}"]
-        new_bin = packer.Bin(
-            prompt_max=prompt_max,
-            decode_max=1024,
-            role="prefill",
-        )
-        # only append if this bin is larger than the last added
-        if not bins or prompt_max > last_prompt_max:
-            bins.append(new_bin)
-            last_prompt_max = prompt_max
-            print(f"Bin {b} added: {prompt_max} > {last_prompt_max}")
-        else:
-            print(f"Bin {b} not added: {prompt_max} <= {last_prompt_max}")
-            # don't add any more bins
-            break
-
-    # print all bins in an array
-    print("Bins:")
-    for b in bins:
-        print(f"  {b.prompt_max}")
-    print("")
 
     slots = []
     for gpu_type in GPU_TYPES:
@@ -145,6 +109,7 @@ def eval_config_outer(params):
 
             # create island
             island = packer.Island(
+                id=f"{gpu_type}_{k}",
                 gpu_type=gpu_type,
                 role="prefill",
                 dp=dp,
@@ -160,13 +125,8 @@ def eval_config_outer(params):
         print(f"  gpu_type={s.gpu_type}, dp={s.dp}, tp={s.tp}")
     print("")
 
-    # error if more bins than slots
-    if len(bins) > len(slots):
-        print(f"ERROR - Configuration rejected: {len(bins)} bins > {len(slots)} slots")
-        return 1e9
-
     # evaluate configuration
-    prefill_speed, _, _, _ = pack.pack_prefill(bins, slots, 1000)
+    prefill_speed = pack.solve_prefill(slots, 1000)
     # calculate rho_max
     rho_max = prefill_speed if prefill_speed != np.inf else 1e9
 
@@ -196,7 +156,7 @@ experiment = Experiment(
 )
 
 # --- Initialization ---
-N_INIT = 5 * len(parameters)
+N_INIT = 20
 
 def initialize_experiment(exp, n_init):
     sobol = Models.SOBOL(search_space=exp.search_space)
