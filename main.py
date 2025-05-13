@@ -12,6 +12,7 @@ from ax.modelbridge.cross_validation import cross_validate, compute_diagnostics
 from ax.service.utils.report_utils import exp_to_df
 from botorch.models.fully_bayesian import SaasFullyBayesianSingleTaskGP
 from ax.models.torch.botorch_modular.surrogate import Surrogate
+from ax.models.torch.botorch_modular.surrogate import SurrogateSpec, ModelConfig
 import numpy as np
 
 import numpy as np
@@ -48,14 +49,6 @@ for gpu_type in GPU_TYPES:
             name=f"tp_{gpu_type}_{k}", parameter_type=ParameterType.INT,
             lower=1, upper=4,
         )
-
-        # Limit TP to count
-        parameter_constraints += [
-            OrderConstraint(
-                lower_parameter=gpu_tp,
-                upper_parameter=gpu_count,
-            )
-        ]
         
         # Add parameters to search space
         parameters.append(gpu_count)
@@ -174,7 +167,7 @@ def generate_okay_configs(n_configs: int = 1):
     return configs
 
 # Generate, for example, 3 warm‐start configurations
-initial_parameters = generate_okay_configs(n_configs=1)
+initial_parameters = generate_okay_configs(n_configs=2)
 
 def add_initial_arms(experiment, initial_parameters):
     for idx, params in enumerate(initial_parameters):
@@ -195,18 +188,25 @@ NUM_SAMPLES = 256
 WARMUP_STEPS = 512
 N_BATCH = 10
 
+model_config = ModelConfig(
+    botorch_model_class=SaasFullyBayesianSingleTaskGP,
+    model_options={},  
+    mll_options={
+        "num_samples": NUM_SAMPLES,
+        "warmup_steps": WARMUP_STEPS,
+        },
+)
+
+surrogate_spec = SurrogateSpec(
+    model_configs=[model_config],
+)
+
 for i in range(N_BATCH):
     # Build SAAS surrogate with NUTS
     model = Models.BOTORCH_MODULAR(
         experiment=experiment,
         data=data,
-        surrogate=Surrogate(
-            botorch_model_class=SaasFullyBayesianSingleTaskGP,
-            mll_options={
-                "num_samples": NUM_SAMPLES,
-                "warmup_steps": WARMUP_STEPS,
-            },
-        ),
+        surrogate_spec=surrogate_spec,
     )
 
     # Generate next candidates with SAASBO
