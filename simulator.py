@@ -1,5 +1,6 @@
 import pandas as pd
 import math
+import numpy as np
 from functools import reduce
 
 NVL_GPU_LIST = [72, 144, 576]
@@ -413,14 +414,14 @@ def _moe_a2a(args: ModelArgs, gpu: GPU_perf, bs, expert_num, device_num, fp8_com
     combine_time = combine_size / comm_bw + static_latency * mbs
     return dispatch_time, combine_time
 
-def decode_time(args: ModelArgs, gpu, dp_num, tp_num, bs_num, seq_len, decode_len, gemm_group_per_device, device_num, tps_limit=0, mbs=2, fp8_combine=False, print_flag=False):
+def decode_time(args: ModelArgs, gpu, tp_num, bs_num, seq_len, decode_len, gemm_group_per_device, device_num, tps_limit=0, mbs=2, fp8_combine=False, print_flag=False):
     expert_per_device = gemm_group_per_device + 1  # add shared expert
 
     max_bs = _decoding_batchsize(args, gpu, seq_len, decode_len, expert_num=expert_per_device, tp_num=tp_num)
 
     if bs_num > max_bs:
         print(f"Batch size {bs_num} exceeds the limit {max_bs}.")
-        return
+        return np.inf
 
     load_kv_time, dense_mla, sparse_mla = decode_mla(args, gpu, tp_num, bs_num, seq_len, decode_len, expert_num=expert_per_device)
     dense_mlp = _prefill_dense_mlp(args, gpu, bs_num)
@@ -435,8 +436,8 @@ def decode_time(args: ModelArgs, gpu, dp_num, tp_num, bs_num, seq_len, decode_le
     delta = comm_sum - sparse_mla - shared_expert
 
     tpot_o = (dense_mla + dense_mlp) * args.n_dense_layers + \
-        (sparse_mla + shared_expert + routed_expert) * (args.n_layers - args.n_dense_layers) / dp_num
-    tpot = tpot_o if delta < 0 else tpot_o + delta * (args.n_layers - args.n_dense_layers) / dp_num
+        (sparse_mla + shared_expert + routed_expert) * (args.n_layers - args.n_dense_layers)
+    tpot = tpot_o if delta < 0 else tpot_o + delta * (args.n_layers - args.n_dense_layers)
 
     tps = 1000 / tpot
     tps_o = 1000 / tpot_o
@@ -455,20 +456,94 @@ def decode_time(args: ModelArgs, gpu, dp_num, tp_num, bs_num, seq_len, decode_le
     return total
 
 # Example usage
-if __name__ == "__main__":
-    args = ModelArgs()
-    gpu_dict = get_gpu_info('./device/gpu_info.csv', decoding_mode=True, discount_rate=0.85)
+# if __name__ == "__main__":
+#     args = ModelArgs()
+#     gpu_dict = get_gpu_info('./device/gpu_info.csv', decoding_mode=True, discount_rate=0.85)
     
-    dp_num = 2
-    tp_num = 4
-    bs_num = 8
+#     dp_num = 2
+#     tp_num = 4
+#     bs_num = 8
 
-    seq_len = 4096
-    decode_len = 512
+#     seq_len = 2048
+#     decode_len = 1024
     
-    gemm_group_per_device = 2
-    device_num = 8
+#     gemm_group_per_device = 2
+#     device_num = 8
 
-    # Example usage of decoding time
-    total_time = decode_time(args, gpu_dict['H200'], dp_num, tp_num, bs_num, seq_len, decode_len, gemm_group_per_device, device_num)
-    print(f"Total decoding time: {total_time} ms")
+#     # Example usage of prefill time
+#     prefill_time = prefill_time(args, gpu_dict['H200'], seq_len, 0.5, tp_num, dp_num)
+#     print(f"Total prefill time: {prefill_time} ms")
+
+#     # Example usage of decoding time
+#     decode_time = decode_time(args, gpu_dict['H200'], dp_num, tp_num, bs_num, seq_len, decode_len, gemm_group_per_device, device_num)
+#     print(f"Total decoding time: {decode_time} ms")
+
+# Example usage
+# if __name__ == "__main__":
+#     args = ModelArgs()
+#     gpu_dict = get_gpu_info('./device/gpu_info.csv', decoding_mode=True, discount_rate=0.85)
+    
+#     dp_num = 2
+#     tp_num = 4
+#     bs_num = 8
+
+#     gemm_group_per_device = 2
+#     device_num = 8
+
+#     # for a range of sequence lengths
+#     seq_lens = np.arange(0, 8192 * 4, 256).astype(int)
+
+#     print("Sequence Length,Prefill (Token/s),Decode (Token/s)")
+
+#     prefill_times = []
+#     prefill_throughput = []
+#     decode_times = []
+#     decode_throughput = []
+
+#     for seq_len in seq_lens:
+#         load_prefill_time = prefill_time(args, gpu_dict['H200'], seq_len, 0.5, tp_num, dp_num)
+#         load_decode_time = decode_time(args, gpu_dict['H200'], dp_num * 10, tp_num, bs_num, seq_len, 1024, gemm_group_per_device, device_num * 4)
+
+#         prefill_times.append(load_prefill_time)
+#         decode_times.append(load_decode_time)
+#         prefill_throughput.append(seq_len / load_prefill_time)
+#         decode_throughput.append(load_decode_time)
+
+#         # Print the results
+#         print(f"{seq_len},{seq_len / load_prefill_time:.5f},{load_decode_time:.5f}")
+
+
+#     # Plotting the prefill and decode times
+#     import matplotlib.pyplot as plt
+#     fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+#     ax[0].plot(seq_lens, prefill_times, label='Prefill Time', color='blue')
+#     ax[0].set_title('Prefill Time vs Sequence Length')
+#     ax[0].set_xlabel('Sequence Length')
+#     ax[0].set_ylabel('Prefill Time (ms)')
+#     ax[0].grid()
+#     ax[0].legend()
+#     ax[1].plot(seq_lens, decode_times, label='Decode Time', color='red')
+#     ax[1].set_title('Decode Time vs Sequence Length')
+#     ax[1].set_xlabel('Sequence Length')
+#     ax[1].set_ylabel('Decode Time (ms)')
+#     ax[1].grid()
+#     ax[1].legend()
+#     plt.tight_layout()
+#     plt.show()
+
+#     # Plotting the prefill and decode throughput
+#     fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+#     ax[0].plot(seq_lens, prefill_throughput, label='Prefill Throughput', color='blue')
+#     ax[0].set_title('Prefill Throughput vs Sequence Length')
+#     ax[0].set_xlabel('Sequence Length')
+#     ax[0].set_ylabel('Prefill Throughput (tokens/ms)')
+#     ax[0].grid()
+#     ax[0].legend()
+#     ax[1].plot(seq_lens, decode_throughput, label='Decode Throughput', color='red')
+#     ax[1].set_title('Decode Throughput vs Sequence Length')
+#     ax[1].set_xlabel('Sequence Length')
+#     ax[1].set_ylabel('Decode Throughput (tokens/ms)')
+#     ax[1].grid()
+#     ax[1].legend()
+#     plt.tight_layout()
+#     plt.show()

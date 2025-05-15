@@ -31,7 +31,8 @@ class Evaluator:
     def __init__(self, gpu_types):
         self.gpu_types = gpu_types
         self.args = simulator.ModelArgs()
-        self.gpu_list = simulator.get_gpu_info('./device/gpu_info.csv', decoding_mode=False, device_list=gpu_types, discount_rate=0.85)
+        self.prefill_gpu_list = simulator.get_gpu_info('./device/gpu_info.csv', decoding_mode=False, device_list=gpu_types, discount_rate=0.85)
+        self.decode_gpu_list = simulator.get_gpu_info('./device/gpu_info.csv', decoding_mode=True, device_list=gpu_types, discount_rate=0.85)
 
     def evaluate(self, config, islands, bins, trace_pdf, ratio=1.0, resolution=10):
         # for each element in trace_pdf, find the corresponding bin
@@ -74,7 +75,7 @@ class Evaluator:
                 decode_island = islands[decode_island_id]
 
                 prefill_throughput = self.prefill_throughput(prefill_island, sequence_length)
-                decode_throughput = self.decode_throughput(decode_island, sequence_length, sequence_length)
+                decode_throughput = self.decode_throughput(decode_island, sequence_length, sequence_length * ratio)
 
                 overall_throughput = self.calculate_throughput(prefill_throughput, decode_throughput, ratio)
                 adjusted_throughput = overall_throughput * probability * resolution
@@ -96,33 +97,37 @@ class Evaluator:
         return results, average_adjusted_throughput
 
     def calculate_throughput(self, prefill_throughput, decode_throughput, ratio):
-        throughput = (ratio + 1) / (ratio / decode_throughput + 1 / prefill_throughput)
-        return throughput
+        # guard against division by zero
+        if prefill_throughput == 0 or decode_throughput == 0:
+            return 0
+        return (ratio + 1) / (ratio / decode_throughput + 1 / prefill_throughput)
 
     def prefill_throughput(self, island, sequence_length):
         time = simulator.prefill_time(
             self.args,
-            self.gpu_list[island.gpu_type],
+            self.prefill_gpu_list[island.gpu_type],
             sequence_length,
             kv_cache_rate=0.5,
             tp_num=island.tp,
             dp_num=island.dp
         )
 
-        return sequence_length / time
+        return sequence_length / time * 1000
     
     def decode_throughput(self, island, sequence_length, decode_length):
         throughput = simulator.decode_time(
             self.args,
-            self.gpu_list[island.gpu_type],
-            dp_num=island.dp,
+            self.decode_gpu_list[island.gpu_type],
             tp_num=island.tp,
-            bs_num=16,
+            bs_num=64,
             seq_len=sequence_length,
             decode_len=decode_length,
             gemm_group_per_device=math.ceil(self.args.n_routed_experts / island.size),
             device_num=island.size,
         )
+
+        if throughput == np.inf:
+            throughput = 0
 
         return throughput
             
@@ -149,13 +154,13 @@ def generate_trace_pdf(max_x, mu=100, sigma=75):
 if __name__ == "__main__":
 
     # create evaluator
-    gpu_types=["DGX-B300", "H20"]
+    gpu_types=["RubinU-NVL576", "H20"]
     evaluator = Evaluator(gpu_types)
     
     # Create islands
     islands = [
-        Island(role="prefill", gpu_type="DGX-B300", dp=1, tp=1, size=1, id="prefill_island_1"),
-        Island(role="decode", gpu_type="DGX-B300", dp=4, tp=1, size=32, id="decode_island_1")
+        Island(role="prefill", gpu_type="RubinU-NVL576", dp=1, tp=1, size=1, id="prefill_island_1"),
+        Island(role="decode", gpu_type="RubinU-NVL576", dp=1, tp=1, size=256, id="decode_island_1")
     ]
     islands = {island.id: island for island in islands}
 
@@ -176,6 +181,11 @@ if __name__ == "__main__":
     pdf_x, pdf_y = generate_trace_pdf(max_x=65536, mu=8192, sigma=8192)
     trace_pdf = (pdf_x, pdf_y)
 
+    # Generate another trace PDF (this is just uniform for testing)
+    # pdf_x = np.arange(0, 65536, 1)
+    # pdf_y = np.ones_like(pdf_x) / len(pdf_x)
+    # trace_pdf = (pdf_x, pdf_y)
+
     # plot pdf
     plt.plot(pdf_x, pdf_y, label="Truncated Gaussian PDF")
     plt.title("Truncated Gaussian PDF")
@@ -188,7 +198,7 @@ if __name__ == "__main__":
     # Evaluate
     ratio = 1.0
     resolution = 1
-    results, throughput = evaluator.evaluate(config, islands, bins, trace_pdf, ratio=ratio, resolution=1000)
+    results, throughput = evaluator.evaluate(config, islands, bins, trace_pdf, ratio=ratio, resolution=10)
 
     # Plot all throughputs on one graph
     sequence_lengths = [r["sequence_length"] for r in results]
@@ -212,6 +222,120 @@ if __name__ == "__main__":
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.plot(sequence_lengths, adjusted_throughputs, label="Adjusted Throughput", color="tab:red")
     ax.axhline(y=throughput, color='r', linestyle='--', label="Average Adjusted Throughput")
+    ax.set_title("Adjusted Throughput vs Sequence Length")
+    ax.set_xlabel("Sequence Length")
+    ax.set_ylabel("Adjusted Tokens/s")
+    ax.grid(True)
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # evaluate with several ratios and plot adjusted throughput
+    ratios = [0.1, 0.5, 1.0, 2.0, 5.0]
+    results_list = []
+    throughput_list = []
+    
+    for ratio in ratios:
+        results, throughput = evaluator.evaluate(config, islands, bins, trace_pdf, ratio=ratio, resolution=10)
+        results_list.append(results)
+        throughput_list.append(throughput)
+
+    # Plot all throughputs on one graph
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for idx, ratio in enumerate(ratios):
+        sequence_lengths = [r["sequence_length"] for r in results_list[idx]]
+        adjusted_throughputs = [r["adjusted_throughput"] for r in results_list[idx]]
+        # plot the adjusted throughput line and grab its color
+        line, = ax.plot(
+            sequence_lengths,
+            adjusted_throughputs,
+            label=f"Ratio {ratio}"
+        )
+        color = line.get_color()
+        # draw the average line in the same color
+        ax.axhline(
+            y=throughput_list[idx],
+            color=color,
+            linestyle='--',
+        )
+    ax.set_title("Adjusted Throughput vs Sequence Length")
+    ax.set_xlabel("Sequence Length")
+    ax.set_ylabel("Adjusted Tokens/s")
+    ax.grid(True)
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # evaluate with static ratio but different island sizes
+    ratio = 1.0
+    island_list = [
+        [
+            Island(role="prefill", gpu_type="RubinU-NVL576", dp=1, tp=1, size=1, id=f"prefill_island_1"),
+            Island(role="decode", gpu_type="RubinU-NVL576", dp=1, tp=1, size=8, id=f"decode_island_1")
+        ],
+        [
+            Island(role="prefill", gpu_type="RubinU-NVL576", dp=1, tp=1, size=1, id=f"prefill_island_1"),
+            Island(role="decode", gpu_type="RubinU-NVL576", dp=1, tp=1, size=16, id=f"decode_island_1")
+        ],
+        [
+            Island(role="prefill", gpu_type="RubinU-NVL576", dp=1, tp=1, size=1, id=f"prefill_island_1"),
+            Island(role="decode", gpu_type="RubinU-NVL576", dp=1, tp=1, size=32, id=f"decode_island_1")
+        ],
+        [
+            Island(role="prefill", gpu_type="RubinU-NVL576", dp=1, tp=1, size=1, id=f"prefill_island_1"),
+            Island(role="decode", gpu_type="RubinU-NVL576", dp=1, tp=1, size=64, id=f"decode_island_1")
+        ],
+        [
+            Island(role="prefill", gpu_type="RubinU-NVL576", dp=1, tp=1, size=1, id=f"prefill_island_1"),
+            Island(role="decode", gpu_type="RubinU-NVL576", dp=1, tp=1, size=128, id=f"decode_island_1")
+        ],
+        [
+            Island(role="prefill", gpu_type="RubinU-NVL576", dp=1, tp=1, size=1, id=f"prefill_island_1"),
+            Island(role="decode", gpu_type="RubinU-NVL576", dp=1, tp=1, size=256, id=f"decode_island_1")
+        ],
+    ]
+    results_list = []
+    throughput_list = []
+
+    for islands in island_list:
+        # Create islands
+        islands = {island.id: island for island in islands}
+
+        # Create bins
+        bins = [
+            Bin(role="prefill", min=0, max=65537, id="prefill_bin_1"),
+            Bin(role="decode", min=0, max=65537, id="decode_bin_1")
+        ]
+        bins = {bin.id: bin for bin in bins}
+
+        # create config
+        config = {
+            "prefill_bin_1": "prefill_island_1",
+            "decode_bin_1": "decode_island_1"
+        }
+
+        results, throughput = evaluator.evaluate(config, islands, bins, trace_pdf, ratio=ratio, resolution=10)
+        results_list.append(results)
+        throughput_list.append(throughput)
+
+    # Plot all throughputs on one graph
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for idx, _ in enumerate(island_list):
+        sequence_lengths = [r["sequence_length"] for r in results_list[idx]]
+        adjusted_throughputs = [r["adjusted_throughput"] for r in results_list[idx]]
+        # plot the adjusted throughput line and grab its color
+        line, = ax.plot(
+            sequence_lengths,
+            adjusted_throughputs,
+            label=f"Island Index {idx}"
+        )
+        color = line.get_color()
+        # draw the average line in the same color
+        ax.axhline(
+            y=throughput_list[idx],
+            color=color,
+            linestyle='--',
+        )
     ax.set_title("Adjusted Throughput vs Sequence Length")
     ax.set_xlabel("Sequence Length")
     ax.set_ylabel("Adjusted Tokens/s")
