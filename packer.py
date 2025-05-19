@@ -1,178 +1,222 @@
 import simulator
+import evaluator
 import numpy as np
 import random
 import string
-from pulp import LpProblem, LpMinimize, LpVariable, lpSum, LpBinary, PULP_CBC_CMD
+import math
+import pulp
 
-def generate_random_string(length):
-    return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
-class Island:
-    def __init__(self, role, gpu_type, dp = 1, tp = 1, size = 0):
-        self.id = generate_random_string(8)
-        self.gpu_type = gpu_type
-        self.role = role
-        self.dp = dp
-        self.tp = tp
-        self.size = size
-
-        if self.role == 'prefill':
-            self.size = self.dp * self.tp
-            
-class Bin:
-    def __init__(self, role, prompt_range):
-        self.role = role
-        self.prompt_range = prompt_range
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+from scipy.integrate import quad
 
 class Packer:
     def __init__(self, gpu_types):
         self.gpu_types = gpu_types
         self.args = simulator.ModelArgs()
-        self.gpu_list = simulator.get_gpu_info('./device/gpu_info.csv', decoding_mode=False, device_list=gpu_types, discount_rate=0.85)
+        self.prefill_gpu_list = simulator.get_gpu_info('./device/gpu_info.csv', decoding_mode=False, device_list=gpu_types, discount_rate=0.85)
+        self.decode_gpu_list = simulator.get_gpu_info('./device/gpu_info.csv', decoding_mode=True, device_list=gpu_types, discount_rate=0.85)
 
-    # test each island with range of prompt lengths to find best bins
-    def solve_prefill(self, islands, print_debug=True):
-        # create a list of prompt lengths evenly spaced
-        prompt_lengths_min = np.arange(0, 1024, 64).astype(int)
-        prompt_lengths_max = prompt_lengths_min + 64
-        prompt_lengths_mid = (prompt_lengths_min + prompt_lengths_max) // 2
+    def solve(self, islands, trace_pdf, resolution=10, print_debug=True):
+        # store probabilities
+        ranges = {}
+        range_idx = 0
+        total_probability = 0
 
-        # extract the prefill islands
-        prefill_islands = [island for island in islands if island.role == 'prefill']
+        # check every sequence length, sample at the midpoint of each resolution interval
+        for idx, sequence_length in enumerate(trace_pdf[0]):
+            midpoint = resolution // 2
+            if idx % resolution == midpoint:
+                # compute the probability of the bin (sum of all bins in range)
+                bin_start = idx - midpoint
+                bin_end = bin_start + resolution
+                probability = np.sum(trace_pdf[1][bin_start:bin_end])
 
-        print("\n=== Prefill Islands ===")
-        for island in prefill_islands:
-            print(f"Island (id={island.id}, gpu_type={island.gpu_type}, size={island.size}, dp={island.dp}, tp={island.tp}, role={island.role})")
+                # store the probability
+                ranges[range_idx] = {
+                    'sequence_length': sequence_length,
+                    'probability': probability,
+                    'min': bin_start,
+                    'max': bin_end,
+                }
 
-        # measure the time for each prompt length
-        results = []
+                # increment total probability
+                total_probability += probability
 
-        for prompt_length in prompt_lengths_mid:
-            local_results = {}
+                # increment the range index
+                range_idx += 1
 
-            for island in prefill_islands:
-                # measure the time for each prompt length
-                time = simulator.prefill_time(
-                    self.args,
-                    self.gpu_list[island.gpu_type],
-                    prompt_length,
-                    kv_cache_rate=1,
-                    tp_num=island.tp,
-                    dp_num=island.dp
-                )
+        # check if the total probability is equal to 1
+        if print_debug:
+            print(f"Total probability: {total_probability:.4f}")
 
-                # store the result for each island
-                local_results[island.id] = time
+        # store the results
+        prefill_benchmark = {}
 
-            # store the result for each prompt length
-            results.append(local_results)
+        # for each prefill island, compute the time
+        for index, (island_id, island) in enumerate(islands.items()):
+            if island.role == 'prefill':
+                
+                # for each range, compute the time
+                for range_idx, range in ranges.items():
+                    # compute the throughput
+                    time_ms = simulator.prefill_time(
+                        self.args,
+                        self.prefill_gpu_list[island.gpu_type],
+                        range['sequence_length'],
+                        kv_cache_rate=1,
+                        tp_num=island.tp,
+                        dp_num=island.dp
+                    )
+
+                    time_s = time_ms / 1000
+                    request_per_second = 1 / time_s
+
+                    # store the result
+                    prefill_benchmark[(island_id, range_idx)] = request_per_second
+
+        # extract Island IDs and sequence lengths
+        island_ids = [island_id for island_id, _ in islands.items() if island.role == 'prefill']
+        range_ids = [range_idx for range_idx in ranges.keys()]
+
+        # print the results
+        if print_debug:
+            print("\n=== Ranges ===")
+            for range_idx, range in ranges.items():
+                print(f"Range {range_idx}: {range['sequence_length']} tokens, Probability: {range['probability']:.4f}, Range: {range['min']}-{range['max']} tokens")
+
+            print("\n=== Prefill Benchmark ===")
+            for island_id, range_idx in prefill_benchmark.keys():
+                print(f"Island {island_id}, Range {range_idx}: {prefill_benchmark[(island_id, range_idx)]:.4f} requests/s")
 
         # create the problem
-        problem = LpProblem("Prefill_Packing_Problem", LpMinimize)
+        problem = pulp.LpProblem("Linearized_LoadBalance", pulp.LpMaximize)
 
-        # decision vars
-        x = {
-            (isl.id, p): LpVariable(f"x_island{isl.id}_mid{p}", cat=LpBinary)
-            for isl in prefill_islands
-            for p in range(len(prompt_lengths_mid))
-        }
-        # makespan variable
-        M = LpVariable("Makespan", lowBound=0)
+        # variables
+        x = pulp.LpVariable.dicts("x", (island_ids, range_ids), lowBound=0)
+        Rj = pulp.LpVariable.dicts("Rj", range_ids, lowBound=0)
+        R = pulp.LpVariable("R", lowBound=0)
+        delta = pulp.LpVariable.dicts("delta", range_ids, lowBound=0)
+        D = pulp.LpVariable("D", lowBound=0)
 
-        # objective: minimize the makespan
-        problem += M
+        # # constraints
 
-        # each prompt range p goes to exactly one island
-        for p in range(len(prompt_lengths_mid)):
-            problem += lpSum(x[(isl.id, p)] for isl in prefill_islands) == 1
+        # each island distributes exactly 1 unit of load
+        for island_id in island_ids:
+            problem += pulp.lpSum(x[island_id][range_idx] for range_idx in range_ids) == 1, f"LoadBalance_{island_id}"
 
-        # for each island, its total assigned time ≤ M
-        for isl in prefill_islands:
-            problem += lpSum(
-                results[p][isl.id] * x[(isl.id, p)]
-                for p in range(len(prompt_lengths_mid))
-            ) <= M
+        # define Rj[j] = sum_i b[i,j] * x[i,j]
+        for range_idx in range_ids:
+            problem += (
+                pulp.lpSum(prefill_benchmark[(island_id, range_idx)] * x[island_id][range_idx] for island_id in island_ids) == Rj[range_idx]
+            ), f"Define_Rj_{range_idx}"
+
+        # define R = sum_j Rj[j]
+        problem += pulp.lpSum(Rj[range_idx] for range_idx in range_ids) == R, "Define_R"
+
+        # deviation linearization: |Rj - p_j*R| <= delta_j
+        for range_idx in range_ids:
+            problem += Rj[range_idx] - ranges[range_idx]['probability'] * R <= delta[range_idx], f"DevPos_{range_idx}"
+            problem += ranges[range_idx]['probability'] * R - Rj[range_idx] <= delta[range_idx], f"DevNeg_{range_idx}"
+
+        # total deviation D = sum delta_j
+        problem += pulp.lpSum(delta[range_idx] for range_idx in range_ids) == D, "Define_D"
+
+        # objective: maximize R - λ·D
+        lambda_dev = 1.0
+        problem += R - lambda_dev * D, "Obj"
 
         # solve
-        problem.solve(PULP_CBC_CMD(
-            msg=False,
+        problem.solve(pulp.PULP_CBC_CMD(
+            msg=True,
             threads=8,
-            timeLimit=60,
         ))
 
-        # extract
-        assignment = {}
-        for p in range(len(prompt_lengths_mid)):
-            for isl in prefill_islands:
-                if x[(isl.id, p)].value() == 1:
-                    assignment[p] = isl
-                    break
-
-        # compute the makespan explicitly
-        island_loads = {
-            isl.id: sum(results[p][isl.id] for p, a in assignment.items() if a.id == isl.id)
-            for isl in prefill_islands
-        }
-        makespan = max(island_loads.values())
-
-        # debug output
         if print_debug:
-            print("\n=== Prefill Assignment ===")
-            for p in range(len(prompt_lengths_mid)):
-                isl = assignment[p]
-                print(f"Range {p} ({prompt_lengths_min[p]}-{prompt_lengths_max[p]} tokens) "
-                      f"→ Island {isl.id}: {results[p][isl.id]:.2f}s")
-            print("\n=== Island Totals ===")
-            for isl in prefill_islands:
-                print(f"Island {isl.id} total prefill time: {island_loads[isl.id]:.2f}s")
-            print(f"Makespan: {makespan:.2f}s")
+            print("\n=== Allocations ===")
+            for island_id in island_ids:
+                for range_idx in range_ids:
+                    print(f"x[{island_id},{range_idx}] = {x[island_id][range_idx].varValue:.4f}")
 
-        return makespan
+            print("\n=== Range perf Rj[j] and deviation |Rj - p_j·R|:")
+            for range_idx in range_ids:
+                rj = Rj[range_idx].varValue
+                dj = delta[range_idx].varValue
+                print(f"  j={range_idx}: Rj={rj:.4f}, δ={dj:.4f}  (target {ranges[range_idx]['probability'] * pulp.value(R):.4f})")
 
-    def evaluate_prefill(self, island, test_trace):
-        # count the frequency of each prompt length
-        prompt_lengths = [prompt_length for prompt_length, _ in test_trace]
-        prompt_length_counts = {length: prompt_lengths.count(length) for length in set(prompt_lengths)}
+        # check if the problem is infeasible
+        if pulp.LpStatus[problem.status] == "Infeasible":
+            print("Problem is infeasible. Please check the constraints.")
+            return None, None, None, None
 
-        # Simulate the prefill time for each trace and calculate the average
-        total_time = 0
-        for prompt_length, _ in test_trace:
-            time = simulator.prefill_time(
-                self.args,
-                self.gpu_list[island.gpu_type],
-                prompt_length,
-                kv_cache_rate=1,
-                tp_num=island.tp,
-                dp_num=island.dp
-            )
+        # extract the assignment
+        assignment = {}
 
-            # scale the time by the frequency of the prompt length
-            frequency = prompt_length_counts[prompt_length]
-            total_time += time * frequency
+        for island_id in island_ids:
+            for range_idx in range_ids:
+                if x[island_id][range_idx].varValue > 0:
+                    assignment[(island_id, range_idx)] = x[island_id][range_idx].varValue
 
-        # Return the average prefill time
-        average_time = total_time 
-        return average_time
+        # print the assignment (group by island and print in blocks
+        if print_debug:
+            print("\n=== Assignment ===")
+            for island_id in island_ids:
+                print(f"Island {island_id}:")
+                for range_idx in range_ids:
+                    if (island_id, range_idx) in assignment:
+                        print(f"  Range {range_idx}: {assignment[(island_id, range_idx)]:.4f}")
+                print()
+
+        # return the assignment
+        return assignment, pulp.value(R), pulp.value(D), pulp.value(problem.objective)
+            
+def generate_trace_pdf(max_x, mu=100, sigma=75):
+    # Define the unnormalized truncated PDF
+    def truncated_gaussian(x):
+        return norm.pdf(x, loc=mu, scale=sigma) if x >= 0 else 0
+
+    # Compute normalization constant over [0, inf)
+    normalization_constant, _ = quad(truncated_gaussian, 0, np.inf)
+
+    # Define the normalized PDF
+    def normalized_pdf(x):
+        return truncated_gaussian(x) / normalization_constant
+
+    # Generate x values at integer intervals
+    x_vals = np.arange(0, max_x + 1, 1)
+    # Compute PDF values
+    y_vals = np.array([normalized_pdf(xi) for xi in x_vals])
+
+    return x_vals, y_vals
 
 # Example usage
 if __name__ == "__main__":
-    gpu_types = ["DGX-B300", "H20"]
+    gpu_types = ["RubinU-NVL576", "H200"]
 
     # Create a packer instance
     packer = Packer(gpu_types)
 
     # Define bins and slots
-    slots = [
-        Island('prefill', 'DGX-B300', tp=4, dp=2),
-        Island('prefill', 'DGX-B300', tp=4, dp=2),
-        Island('prefill', 'DGX-B300', tp=4, dp=2),
-        Island('prefill', 'DGX-B300', tp=4, dp=2),
-        Island('prefill', 'DGX-B300', tp=4, dp=2),
-        Island('prefill', 'DGX-B300', tp=4, dp=2),
-        Island('prefill', 'DGX-B300', tp=4, dp=2),
-        Island('prefill', 'DGX-B300', tp=4, dp=2)
+    islands = [
+        evaluator.Island(role="prefill", gpu_type="RubinU-NVL576", dp=1, tp=1, size=1, id="prefill_island_1"),
+        evaluator.Island(role="prefill", gpu_type="RubinU-NVL576", dp=2, tp=4, size=1, id="prefill_island_2"),
+        evaluator.Island(role="prefill", gpu_type="RubinU-NVL576", dp=4, tp=8, size=1, id="prefill_island_3"),
+        evaluator.Island(role="prefill", gpu_type="H200", dp=1, tp=1, size=1, id="prefill_island_4"),
+        evaluator.Island(role="prefill", gpu_type="H200", dp=2, tp=4, size=1, id="prefill_island_5"),
+        evaluator.Island(role="prefill", gpu_type="H200", dp=4, tp=8, size=1, id="prefill_island_6"),
     ]
+    islands = {island.id: island for island in islands}
+
+    # Generate trace PDF
+    pdf_x, pdf_y = generate_trace_pdf(max_x=8000, mu=500, sigma=2000)
+    trace_pdf = (pdf_x, pdf_y / np.sum(pdf_y))
+    print("Trace PDF sum:", np.sum(trace_pdf[1]))
 
     # Pack the prefill bins
-    time = packer.solve_prefill(slots, print_debug=True)
+    assignment, throughput, delta, objective = packer.solve(islands, trace_pdf, resolution=5, print_debug=False)
 
-    print(f"\nTotal prefill time: {time:.2f}s")
+    if assignment is not None:
+        print("\n=== Results ===")
+        print(f"Throughput: {throughput:.4f} requests/s")
+        print(f"Deviation: {delta:.4f}")
+        print(f"Objective: {objective:.4f}")
