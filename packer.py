@@ -17,7 +17,7 @@ class Packer:
         self.prefill_gpu_list = simulator.get_gpu_info('./device/gpu_info.csv', decoding_mode=False, device_list=gpu_types, discount_rate=0.85)
         self.decode_gpu_list = simulator.get_gpu_info('./device/gpu_info.csv', decoding_mode=True, device_list=gpu_types, discount_rate=0.85)
 
-    def solve_prefill(self, islands, trace_pdf, resolution=10, print_debug=True):
+    def solve(self, islands, trace_pdf, resolution=10, print_debug=True):
         # store probabilities
         ranges = {}
         range_idx = 0
@@ -100,7 +100,7 @@ class Packer:
         D = pulp.LpVariable("D", lowBound=0)
 
         # constraints
-        tau = 0.1 # hard‐cap on each deviation
+        tau = 0.001 # hard‐cap on each deviation
         M = 1000 # base penalty scale
         lambda_dev = {j: M/(1 + ranges[j]['probability']) for j in range_ids}  # soft‐penalty scale
 
@@ -171,10 +171,10 @@ class Packer:
 
         # construct model
         model = {
+            'ranges': ranges,
             'assignment': assignment,
             'throughput': throughput,
             'deviation': deviation,
-            'ranges': ranges,
         }
 
         # return the assignment
@@ -229,10 +229,35 @@ if __name__ == "__main__":
     print("Trace PDF sum:", np.sum(trace_pdf[1]))
 
     # Pack the prefill bins
-    model, throughput, delta, objective = packer.solve(islands, trace_pdf, resolution=50, print_debug=True)
+    model, throughput, delta, objective = packer.solve(islands, trace_pdf, resolution=1, print_debug=True)
 
     if model is not None:
         print("\n=== Results ===")
         print(f"Throughput: {throughput:.4f} requests/s")
         print(f"Deviation: {delta:.4f}")
         print(f"Objective: {objective:.4f}")
+
+        # add assignments to the islands
+        for (island_id, range_idx), value in model['assignment'].items():
+            islands[island_id].assign(
+                (
+                    evaluator.Bin(
+                        min=model['ranges'][range_idx]['min'],
+                        max=model['ranges'][range_idx]['max'],
+                    ),
+                    value
+                )
+            )
+
+        # save model throughputs values to csv
+        with open("model_throughput.csv", "w") as f:
+            f.write("Sequence,Throughput\n")
+            for range_idx, throughput in model['throughput'].items():
+                f.write(f"{model['ranges'][range_idx]['sequence_length']},{throughput}\n")
+
+        # pass to evaluator
+        evaluator = evaluator.Evaluator(gpu_types)
+        throughput = evaluator.evaluate(islands, trace_pdf, print_debug=False)
+
+        print("\n=== Evaluator Results ===")
+        print(f"Throughput: {throughput:.4f} requests/s")
