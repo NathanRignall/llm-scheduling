@@ -1,12 +1,6 @@
-import simulator
-import numpy as np
+import pandas as pd
 import random
 import string
-import math
-
-import matplotlib.pyplot as plt
-from scipy.stats import norm
-from scipy.integrate import quad
 
 import simulator
 
@@ -116,3 +110,14 @@ class Evaluator:
             total_throughput += result["total_throughput"]
 
         return total_throughput
+    
+def load_trace_pdf(trace_pdf_path):
+    # open csv file
+    trace_df = pd.read_csv(trace_pdf_path)
+
+    # get the sequence length and probability
+    sequence_length = trace_df["Length"].values
+    probability = trace_df["Probability"].values
+
+    # return as a tuple
+    return (sequence_length, probability)

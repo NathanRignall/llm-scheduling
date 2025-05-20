@@ -223,13 +223,11 @@ if __name__ == "__main__":
     ]
     islands = {island.id: island for island in islands}
 
-    # Generate trace PDF
-    pdf_x, pdf_y = generate_trace_pdf(max_x=8000, mu=500, sigma=2000)
-    trace_pdf = (pdf_x, pdf_y / np.sum(pdf_y))
-    print("Trace PDF sum:", np.sum(trace_pdf[1]))
+    # load the trace PDF
+    trace_pdf = evaluator.load_trace_pdf("traces/conv_context_tokens_hist.csv")
 
     # Pack the prefill bins
-    model, throughput, delta, objective = packer.solve(islands, trace_pdf, resolution=1, print_debug=True)
+    model, throughput, delta, objective = packer.solve(islands, trace_pdf, resolution=10, print_debug=True)
 
     if model is not None:
         print("\n=== Results ===")
