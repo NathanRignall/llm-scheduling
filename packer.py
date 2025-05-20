@@ -17,7 +17,7 @@ class Packer:
         self.prefill_gpu_list = simulator.get_gpu_info('./device/gpu_info.csv', decoding_mode=False, device_list=gpu_types, discount_rate=0.85)
         self.decode_gpu_list = simulator.get_gpu_info('./device/gpu_info.csv', decoding_mode=True, device_list=gpu_types, discount_rate=0.85)
 
-    def solve(self, islands, trace_pdf, resolution=10, print_debug=True):
+    def solve_prefill(self, islands, trace_pdf, resolution=10, print_debug=True):
         # store probabilities
         ranges = {}
         range_idx = 0
@@ -99,7 +99,10 @@ class Packer:
         delta = pulp.LpVariable.dicts("delta", range_ids, lowBound=0)
         D = pulp.LpVariable("D", lowBound=0)
 
-        # # constraints
+        # constraints
+        tau = 0.1 # hard‐cap on each deviation
+        M = 1000 # base penalty scale
+        lambda_dev = {j: M/(1 + ranges[j]['probability']) for j in range_ids}  # soft‐penalty scale
 
         # each island distributes exactly 1 unit of load
         for island_id in island_ids:
@@ -121,10 +124,13 @@ class Packer:
 
         # total deviation D = sum delta_j
         problem += pulp.lpSum(delta[range_idx] for range_idx in range_ids) == D, "Define_D"
+        
+        # Hard‐cap on each deviation: δ_j ≤ τ·p_j·R
+        for range_idx in range_ids:
+            problem += delta[range_idx] <= tau * ranges[range_idx]['probability'] * R, f"HardCap_{range_idx}"
 
-        # objective: maximize R - λ·D
-        lambda_dev = 1.0
-        problem += R - lambda_dev * D, "Obj"
+        # Objective: maximize R minus weighted sum of deviations
+        problem += R - pulp.lpSum(lambda_dev[range_idx] * delta[range_idx] for range_idx in range_ids), "Objective"
 
         # solve
         problem.solve(pulp.PULP_CBC_CMD(
@@ -151,24 +157,28 @@ class Packer:
 
         # extract the assignment
         assignment = {}
-
         for island_id in island_ids:
             for range_idx in range_ids:
                 if x[island_id][range_idx].varValue > 0:
                     assignment[(island_id, range_idx)] = x[island_id][range_idx].varValue
 
-        # print the assignment (group by island and print in blocks
-        if print_debug:
-            print("\n=== Assignment ===")
-            for island_id in island_ids:
-                print(f"Island {island_id}:")
-                for range_idx in range_ids:
-                    if (island_id, range_idx) in assignment:
-                        print(f"  Range {range_idx}: {assignment[(island_id, range_idx)]:.4f}")
-                print()
+        # extract the throughput and deviation
+        throughput = {}
+        deviation = {}
+        for range_idx in range_ids:
+            throughput[range_idx] = Rj[range_idx].varValue
+            deviation[range_idx] = delta[range_idx].varValue
+
+        # construct model
+        model = {
+            'assignment': assignment,
+            'throughput': throughput,
+            'deviation': deviation,
+            'ranges': ranges,
+        }
 
         # return the assignment
-        return assignment, pulp.value(R), pulp.value(D), pulp.value(problem.objective)
+        return model, pulp.value(R), pulp.value(D), pulp.value(problem.objective)
             
 def generate_trace_pdf(max_x, mu=100, sigma=75):
     # Define the unnormalized truncated PDF
@@ -191,7 +201,7 @@ def generate_trace_pdf(max_x, mu=100, sigma=75):
 
 # Example usage
 if __name__ == "__main__":
-    gpu_types = ["RubinU-NVL576", "H200"]
+    gpu_types = ["RubinU-NVL576", "H200", "H800"]
 
     # Create a packer instance
     packer = Packer(gpu_types)
@@ -204,6 +214,12 @@ if __name__ == "__main__":
         evaluator.Island(role="prefill", gpu_type="H200", dp=1, tp=1, size=1, id="prefill_island_4"),
         evaluator.Island(role="prefill", gpu_type="H200", dp=2, tp=4, size=1, id="prefill_island_5"),
         evaluator.Island(role="prefill", gpu_type="H200", dp=4, tp=8, size=1, id="prefill_island_6"),
+        evaluator.Island(role="prefill", gpu_type="H800", dp=1, tp=1, size=1, id="prefill_island_7"),
+        evaluator.Island(role="prefill", gpu_type="H800", dp=2, tp=4, size=1, id="prefill_island_8"),
+        evaluator.Island(role="prefill", gpu_type="H800", dp=4, tp=8, size=1, id="prefill_island_9"),
+        evaluator.Island(role="prefill", gpu_type="H800", dp=8, tp=16, size=1, id="prefill_island_10"),
+        evaluator.Island(role="prefill", gpu_type="H800", dp=16, tp=32, size=1, id="prefill_island_11"),
+        evaluator.Island(role="prefill", gpu_type="H800", dp=32, tp=64, size=1, id="prefill_island_12"),
     ]
     islands = {island.id: island for island in islands}
 
@@ -213,9 +229,9 @@ if __name__ == "__main__":
     print("Trace PDF sum:", np.sum(trace_pdf[1]))
 
     # Pack the prefill bins
-    assignment, throughput, delta, objective = packer.solve(islands, trace_pdf, resolution=5, print_debug=False)
+    model, throughput, delta, objective = packer.solve(islands, trace_pdf, resolution=50, print_debug=True)
 
-    if assignment is not None:
+    if model is not None:
         print("\n=== Results ===")
         print(f"Throughput: {throughput:.4f} requests/s")
         print(f"Deviation: {delta:.4f}")
