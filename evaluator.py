@@ -1,6 +1,7 @@
 import pandas as pd
 import random
 import string
+import math
 
 import simulator
 
@@ -99,7 +100,7 @@ class Evaluator:
             results[sequence_length]["total_throughput"] = total_throughput
 
         # save throughput["weighted_request_per_second"] values to a csv file
-        with open("throughput.csv", "w") as f:
+        with open("./data/scratch/true_throughput.csv", "w") as f:
             f.write("Sequence,Throughput\n")
             for sequence_length, result in results.items():
                 f.write(f"{sequence_length},{result['total_throughput']}\n")
@@ -110,6 +111,24 @@ class Evaluator:
             total_throughput += result["total_throughput"]
 
         return total_throughput
+    
+    def evaluate_decode_single(self, island, sequence_length, decode_length):
+        total_time = 0
+
+        for current_decode_length in range(decode_length):
+            # calculate the throughput for each assignment
+            time_ms = simulator.decode_time(
+                self.args,
+                self.gpu_list[island.gpu_type],
+                dp_num=island.dp,
+                tp_num=island.tp,
+                bs_num=16,
+                seq_len=sequence_length,
+                decode_len=current_decode_length,
+                gemm_group_per_device=math.ceil(self.args.n_routed_experts / island.size),
+                device_num=island.size,
+            )
+            total_time += time_ms / 1000
     
 def load_trace_pdf(trace_pdf_path):
     # open csv file

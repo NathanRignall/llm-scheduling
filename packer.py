@@ -1,14 +1,7 @@
 import simulator
 import evaluator
 import numpy as np
-import random
-import string
-import math
 import pulp
-
-import matplotlib.pyplot as plt
-from scipy.stats import norm
-from scipy.integrate import quad
 
 class Packer:
     def __init__(self, gpu_types):
@@ -179,25 +172,6 @@ class Packer:
 
         # return the assignment
         return model, pulp.value(R), pulp.value(D), pulp.value(problem.objective)
-            
-def generate_trace_pdf(max_x, mu=100, sigma=75):
-    # Define the unnormalized truncated PDF
-    def truncated_gaussian(x):
-        return norm.pdf(x, loc=mu, scale=sigma) if x >= 0 else 0
-
-    # Compute normalization constant over [0, inf)
-    normalization_constant, _ = quad(truncated_gaussian, 0, np.inf)
-
-    # Define the normalized PDF
-    def normalized_pdf(x):
-        return truncated_gaussian(x) / normalization_constant
-
-    # Generate x values at integer intervals
-    x_vals = np.arange(0, max_x + 1, 1)
-    # Compute PDF values
-    y_vals = np.array([normalized_pdf(xi) for xi in x_vals])
-
-    return x_vals, y_vals
 
 # Example usage
 if __name__ == "__main__":
@@ -224,7 +198,7 @@ if __name__ == "__main__":
     islands = {island.id: island for island in islands}
 
     # load the trace PDF
-    trace_pdf = evaluator.load_trace_pdf("traces/conv_context_tokens_hist.csv")
+    trace_pdf = evaluator.load_trace_pdf("traces/generated_trace_pdf.csv")
 
     # Pack the prefill bins
     model, throughput, delta, objective = packer.solve(islands, trace_pdf, resolution=10, print_debug=True)
@@ -248,7 +222,7 @@ if __name__ == "__main__":
             )
 
         # save model throughputs values to csv
-        with open("model_throughput.csv", "w") as f:
+        with open("./data/scratch/model_throughput.csv", "w") as f:
             f.write("Sequence,Throughput\n")
             for range_idx, throughput in model['throughput'].items():
                 f.write(f"{model['ranges'][range_idx]['sequence_length']},{throughput}\n")

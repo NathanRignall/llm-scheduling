@@ -453,7 +453,7 @@ def decode_time(args: ModelArgs, gpu, tp_num, bs_num, seq_len, decode_len, gemm_
         print(f"tps: {round(tps, 6)}ms, tps_o: {round(tps_o, 6)}ms")
         print(f"CommImpact: {round(comm_impact, 6)}ms")
 
-    return total
+    return tpot_o, total_o
 
 # Example usage
 # if __name__ == "__main__":

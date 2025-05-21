@@ -4,3 +4,9 @@ traces/code_context_tokens_hist.csv filter=lfs diff=lfs merge=lfs -text
 traces/code_generated_tokens_hist.csv filter=lfs diff=lfs merge=lfs -text
 traces/conv_context_tokens_hist.csv filter=lfs diff=lfs merge=lfs -text
 traces/conv_generated_tokens_hist.csv filter=lfs diff=lfs merge=lfs -text
+traces/burst_code_generated_tokens_hist.csv filter=lfs diff=lfs merge=lfs -text
+traces/burst_conv_context_tokens_hist.csv filter=lfs diff=lfs merge=lfs -text
+traces/burst_conv_generated_tokens_hist.csv filter=lfs diff=lfs merge=lfs -text
+traces/generated_trace_pdf.csv filter=lfs diff=lfs merge=lfs -text
+traces/BurstGPT_without_fails_2.csv filter=lfs diff=lfs merge=lfs -text
+traces/burst_code_context_tokens_hist.csv filter=lfs diff=lfs merge=lfs -text
