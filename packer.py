@@ -2,6 +2,10 @@ import simulator
 import evaluator
 import numpy as np
 import pulp
+from pyomo.environ import (
+    ConcreteModel, Var, Expression, Constraint, Objective,
+    SolverFactory, NonNegativeReals, value
+)
 
 class Packer:
     def __init__(self, gpu_types):
@@ -10,7 +14,7 @@ class Packer:
         self.prefill_gpu_list = simulator.get_gpu_info('./device/gpu_info.csv', decoding_mode=False, device_list=gpu_types, discount_rate=0.85)
         self.decode_gpu_list = simulator.get_gpu_info('./device/gpu_info.csv', decoding_mode=True, device_list=gpu_types, discount_rate=0.85)
 
-    def solve(self, islands, trace_pdf, resolution=10, print_debug=True):
+    def solve_linear(self, islands, trace_pdf, resolution=10, print_debug=True):
         # store probabilities
         ranges = {}
         range_idx = 0
@@ -127,7 +131,7 @@ class Packer:
 
         # solve
         problem.solve(pulp.PULP_CBC_CMD(
-            msg=True,
+            msg=print_debug,
             threads=8,
         ))
 
@@ -172,6 +176,177 @@ class Packer:
 
         # return the assignment
         return model, pulp.value(R), pulp.value(D), pulp.value(problem.objective)
+    
+    def solve_non_linear(self, islands, trace_pdf, resolution=10, print_debug=True):
+        # store probabilities
+        ranges = {}
+        range_idx = 0
+        total_probability = 0
+
+        # check every sequence length, sample at the midpoint of each resolution interval
+        for idx, sequence_length in enumerate(trace_pdf[0]):
+            midpoint = resolution // 2
+            if idx % resolution == midpoint:
+                # compute the probability of the bin (sum of all bins in range)
+                bin_start = idx - midpoint
+                bin_end = bin_start + resolution
+                probability = np.sum(trace_pdf[1][bin_start:bin_end])
+
+                # store the probability
+                ranges[range_idx] = {
+                    'sequence_length': sequence_length,
+                    'probability': probability,
+                    'min': bin_start,
+                    'max': bin_end,
+                }
+
+                # increment total probability
+                total_probability += probability
+
+                # increment the range index
+                range_idx += 1
+
+        # check if the total probability is equal to 1
+        if print_debug:
+            print(f"Total probability: {total_probability:.4f}")
+
+        # store the results
+        prefill_benchmark = {}
+
+        # for each prefill island, compute the time
+        for index, (island_id, island) in enumerate(islands.items()):
+            if island.role == 'prefill':
+                
+                # for each range, compute the time
+                for range_idx, range in ranges.items():
+                    # compute the throughput
+                    time_ms = simulator.prefill_time(
+                        self.args,
+                        self.prefill_gpu_list[island.gpu_type],
+                        range['sequence_length'],
+                        kv_cache_rate=1,
+                        tp_num=island.tp,
+                        dp_num=island.dp
+                    )
+
+                    time_s = time_ms / 1000
+                    request_per_second = 1 / time_s
+
+                    # store the result
+                    prefill_benchmark[(island_id, range_idx)] = request_per_second
+
+        # extract Island IDs and sequence lengths
+        island_ids = [island_id for island_id, _ in islands.items() if island.role == 'prefill']
+        range_ids = [range_idx for range_idx in ranges.keys()]
+
+        # print the results
+        if print_debug:
+            print("\n=== Ranges ===")
+            for range_idx, range in ranges.items():
+                print(f"Range {range_idx}: {range['sequence_length']} tokens, Probability: {range['probability']:.4f}, Range: {range['min']}-{range['max']} tokens")
+
+            print("\n=== Prefill Benchmark ===")
+            for island_id, range_idx in prefill_benchmark.keys():
+                print(f"Island {island_id}, Range {range_idx}: {prefill_benchmark[(island_id, range_idx)]:.4f} requests/s")
+
+        # create the problem
+        model = ConcreteModel()
+
+        # variables
+        model.x = Var(island_ids, range_ids, within=NonNegativeReals)
+        model.Rj = Var(range_ids, within=NonNegativeReals)
+        model.R = Var(within=NonNegativeReals)
+        model.s = Var(range_ids, within=NonNegativeReals)
+        model.D = Var(within=NonNegativeReals)
+
+        # each island distributes exactly 1 unit of load
+        model.LoadBalance = Constraint(
+            island_ids,
+            rule=lambda m, island_id: sum(m.x[island_id, range_idx] for range_idx in range_ids) == 1
+        )
+
+        # total performance
+        model.R_def = Constraint(
+            expr= model.R
+            == sum(
+                prefill_benchmark[(island_id, range_idx)]
+                * model.x[island_id, range_idx]
+                for island_id in island_ids
+                for range_idx in range_ids
+            )
+        )
+
+        # performance per range
+        model.Rj_def = Constraint(
+            range_ids,
+            rule=lambda m, range_idx: m.Rj[range_idx]
+            == sum(
+                prefill_benchmark[(island_id, range_idx)]
+                * m.x[island_id, range_idx]
+                for island_id in island_ids
+            )
+        )
+
+        # achieved share
+        model.s_def = Constraint(
+            range_ids,
+            rule=lambda m, range_idx: m.s[range_idx] * m.R == m.Rj[range_idx]
+        )
+
+        # deviation expression δ[j]
+        model.delta = Expression(
+            range_ids,
+            rule=lambda m, range_idx: abs(m.s[range_idx] - ranges[range_idx]['probability'])
+        )
+
+        # total deviation
+        model.D_def = Constraint(
+            expr=model.D == sum(model.delta[range_idx] for range_idx in range_ids)
+        )
+
+        # hard‐match target (allow tiny numerical slack)
+        tol = 0.1
+        model.MatchTarget = Constraint(
+            expr=model.D <= tol
+        )
+
+        # Objective: maximize R minus weighted sum of deviations
+        model.objective = Objective(expr=model.R, sense=1)
+
+        # solve parameters
+        solver = SolverFactory('ipopt')
+
+        # solve the model
+        solver.solve(model, tee=True)
+
+        print("\n=== Solution Summary ===")
+        print(f"Total performance R       = {value(model.R):.4f}")
+        print(f"Total deviation D         = {value(model.D):.6e}\n")
+
+        # extract the assignment
+        assignment = {}
+        for island_id in island_ids:
+            for range_idx in range_ids:
+                if model.x[island_id, range_idx].value > 0:
+                    assignment[(island_id, range_idx)] = model.x[island_id, range_idx].value
+
+        # extract the throughput and deviation
+        throughput = {}
+        deviation = {}
+        for range_idx in range_ids:
+            throughput[range_idx] = model.Rj[range_idx].value
+            deviation[range_idx] = 0
+
+        # construct model
+        model_output = {
+            'ranges': ranges,
+            'assignment': assignment,
+            'throughput': throughput,
+            'deviation': deviation,
+        }
+
+        # return the assignment
+        return model_output, value(model.R), value(model.D), value(model.objective)
 
 # Example usage
 if __name__ == "__main__":
@@ -198,11 +373,12 @@ if __name__ == "__main__":
     islands = {island.id: island for island in islands}
 
     # load the trace PDF
-    trace_pdf = evaluator.load_trace_pdf("traces/generated_trace_pdf.csv")
+    trace_pdf = evaluator.load_trace_pdf("traces/conv_context_tokens_hist.csv")
 
     # Pack the prefill bins
-    model, throughput, delta, objective = packer.solve(islands, trace_pdf, resolution=10, print_debug=True)
+    model, throughput, delta, objective = packer.solve_linear(islands, trace_pdf, resolution=100, print_debug=False)
 
+    # check if the model is not None
     if model is not None:
         print("\n=== Results ===")
         print(f"Throughput: {throughput:.4f} requests/s")
@@ -233,3 +409,7 @@ if __name__ == "__main__":
 
         print("\n=== Evaluator Results ===")
         print(f"Throughput: {throughput:.4f} requests/s")
+
+    # do not print the model
+    else:
+        print("No solution found.")
