@@ -317,11 +317,7 @@ class Packer:
         solver = SolverFactory('ipopt')
 
         # solve the model
-        solver.solve(model, tee=True)
-
-        print("\n=== Solution Summary ===")
-        print(f"Total performance R       = {value(model.R):.4f}")
-        print(f"Total deviation D         = {value(model.D):.6e}\n")
+        solver.solve(model, tee=print_debug)
 
         # extract the assignment
         assignment = {}
