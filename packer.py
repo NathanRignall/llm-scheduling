@@ -105,15 +105,14 @@ class Packer:
 
                 # compute the throughput for each token
                 total_time_ms = 0
-                request_per_second = 0
                 for current_decode_length in __builtins__.range(1, self.decode_len_avg, 1):
                     time_ms, _ = simulator.decode_time(
                         self.args,
                         self.decode_gpu_list[island.gpu_type],
                         tp_num=island.tp,
                         bs_num=self.batch_size,
-                        seq_len=range['sequence_length'],
-                        decode_len=current_decode_length,
+                        seq_len=range['sequence_length'] + current_decode_length,
+                        decode_len=self.decode_len_avg - current_decode_length,
                         gemm_group_per_device=math.ceil(self.args.n_routed_experts / island.size),
                         device_num=island.size,
                     )
@@ -128,10 +127,10 @@ class Packer:
                         total_time_ms += time_ms
 
                 time_s = total_time_ms / 1000
-                request_per_second = 1 / time_s if total_time_ms != np.inf else 0
+                request_per_second = (1 / time_s * self.batch_size ) if total_time_ms != np.inf else 0
 
                 # store the result
-                decode_benchmark[(island_id, range_idx)] = request_per_second * self.batch_size
+                decode_benchmark[(island_id, range_idx)] = request_per_second 
 
         # print the results
         if print_debug:
@@ -303,7 +302,7 @@ class Packer:
             },
         }
 
-        if print_debug:
+        if True:
             # print the binary variables (to see if prefill or decode is selected)
             print("\n=== Binary Variables ===")
             for island_id in island_ids:
@@ -328,10 +327,14 @@ if __name__ == "__main__":
 
     # Define bins and slots
     islands = [
-        evaluator.Island(gpu_type="RubinU-NVL576", dp=1, tp=1, size=1, id="island_1"),
-        evaluator.Island(gpu_type="RubinU-NVL576", dp=2, tp=4, size=1, id="island_2"),
-        evaluator.Island(gpu_type="RubinU-NVL576", dp=1, tp=4, size=128, id="island_3"),
+        evaluator.Island(gpu_type="RubinU-NVL576", dp=2, tp=4, size=1, id="island_1"),
+        evaluator.Island(gpu_type="RubinU-NVL576", dp=2, tp=4, size=2, id="island_2"),
+        evaluator.Island(gpu_type="RubinU-NVL576", dp=2, tp=4, size=4, id="island_3"),
         evaluator.Island(gpu_type="RubinU-NVL576", dp=1, tp=8, size=128, id="island_4"),
+        evaluator.Island(gpu_type="H200", dp=1, tp=8, size=128, id="island_5"),
+        evaluator.Island(gpu_type="H800", dp=1, tp=8, size=128, id="island_6"),
+        evaluator.Island(gpu_type="H20", dp=1, tp=8, size=128, id="island_7"),
+        evaluator.Island(gpu_type="H20", dp=1, tp=8, size=128, id="island_8"),
     ]
     islands = {island.id: island for island in islands}
 
@@ -339,11 +342,11 @@ if __name__ == "__main__":
     trace_pdf = evaluator.load_trace_pdf("traces/generated_trace_pdf.csv")
 
     # Pack the prefill bins
-    model, prefill_throughput, decode_throughput, delta, objective = packer.solve_linear(islands, trace_pdf, resolution=500, print_debug=False)
+    model, prefill_throughput, decode_throughput, delta, objective = packer.solve_linear(islands, trace_pdf, resolution=10, print_debug=False)
 
     # check if the model is not None
     if model is not None:
-        print("\n=== Results ===")
+        print("\n=== Packer Results ===")
         print(f"Prefill Throughput: {prefill_throughput:.4f} requests/s")
         print(f"Decode Throughput: {decode_throughput:.4f} requests/s")
         print(f"Deviation: {delta:.4f}")
@@ -351,7 +354,17 @@ if __name__ == "__main__":
 
         # add assignments to the islands
         for (island_id, range_idx), value in model['prefill']['assignment'].items():
-            islands[island_id].assign(
+            islands[island_id].assign_prefill(
+                (
+                    evaluator.Bin(
+                        min=model['ranges'][range_idx]['min'],
+                        max=model['ranges'][range_idx]['max'],
+                    ),
+                    value
+                )
+            )
+        for (island_id, range_idx), value in model['decode']['assignment'].items():
+            islands[island_id].assign_decode(
                 (
                     evaluator.Bin(
                         min=model['ranges'][range_idx]['min'],
@@ -371,12 +384,21 @@ if __name__ == "__main__":
             for range_idx, throughput in model['decode']['throughput'].items():
                 f.write(f"{model['ranges'][range_idx]['sequence_length']},{throughput}\n")
 
+        # save the assignment to a csv
+        with open("./data/scratch/model_assignment.csv", "w") as f:
+            f.write("Island,Range,Prefill,Decode\n")
+            for (island_id, range_idx), value in model['prefill']['assignment'].items():
+                f.write(f"{island_id},{range_idx},{value},0\n")
+            for (island_id, range_idx), value in model['decode']['assignment'].items():
+                f.write(f"{island_id},{range_idx},0,{value}\n")
+
         # pass to evaluator
         evaluator = evaluator.Evaluator(gpu_types)
-        throughput = evaluator.evaluate(islands, trace_pdf, print_debug=False)
+        prefill_throughput, decode_throughput = evaluator.evaluate(islands, trace_pdf, print_debug=False)
 
         print("\n=== Evaluator Results ===")
-        print(f"Throughput: {throughput:.4f} requests/s")
+        print(f"Prefill Throughput: {prefill_throughput:.4f} requests/s")
+        print(f"Decode Throughput: {decode_throughput:.4f} requests/s")
 
     # do not print the model
     else:
