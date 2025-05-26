@@ -20,7 +20,7 @@ class Packer:
         print("*** Forming Ranges ***")
         # store probabilities
         ranges = {}
-        range_idx = 0
+        range_id = 0
         total_probability = 0
 
         # check every sequence length, sample at the midpoint of each resolution interval
@@ -33,7 +33,7 @@ class Packer:
                 probability = np.sum(trace_pdf[1][bin_start:bin_end])
 
                 # store the probability
-                ranges[range_idx] = {
+                ranges[range_id] = {
                     'sequence_length': sequence_length,
                     'probability': probability,
                     'min': bin_start,
@@ -44,7 +44,7 @@ class Packer:
                 total_probability += probability
 
                 # increment the range index
-                range_idx += 1
+                range_id += 1
 
         # check if the total probability is equal to 1
         if print_debug:
@@ -55,7 +55,7 @@ class Packer:
         prefill_benchmark = {}
         for index, (island_id, island) in enumerate(islands.items()):
             # for each range, compute the time
-            for range_idx, range in ranges.items():
+            for range_id, range in ranges.items():
                 # compute the throughput
                 time_ms = simulator.prefill_time(
                     self.args,
@@ -70,7 +70,7 @@ class Packer:
                 request_per_second = 1 / time_s
 
                 # store the result
-                prefill_benchmark[(island_id, range_idx)] = request_per_second
+                prefill_benchmark[(island_id, range_id)] = request_per_second
 
         # for each island, compute the decode time
         print("*** Decode Benchmark ***")
@@ -78,10 +78,10 @@ class Packer:
         for index, (island_id, island) in enumerate(islands.items()):
             failed = False
             # for each range, compute the time
-            for range_idx, range in ranges.items():
+            for range_id, range in ranges.items():
                 # if failed, skip the range
                 if failed:
-                    decode_benchmark[(island_id, range_idx)] = 0
+                    decode_benchmark[(island_id, range_id)] = 0
                     continue
 
                 # check if the range can support the largest decode length
@@ -98,9 +98,9 @@ class Packer:
                 # don't continue if the time is infinite
                 if max_bs < self.batch_size:
                     if print_debug:
-                        print(f"Island {island_id} cannot support the decode length for range {range_idx}. Batch size: {self.batch_size}, Max batch size: {max_bs}")
+                        print(f"Island {island_id} cannot support the decode length for range {range_id}. Batch size: {self.batch_size}, Max batch size: {max_bs}")
                     failed = True
-                    decode_benchmark[(island_id, range_idx)] = 0
+                    decode_benchmark[(island_id, range_id)] = 0
                     continue
 
                 # compute the throughput for each token
@@ -121,7 +121,7 @@ class Packer:
                     if time_ms == np.inf:
                         total_time_ms = np.inf
                         if print_debug:
-                            print(f"Island {island_id} cannot support the decode length for range {range_idx}.")
+                            print(f"Island {island_id} cannot support the decode length for range {range_id}.")
                         break
                     else:
                         total_time_ms += time_ms
@@ -130,25 +130,25 @@ class Packer:
                 request_per_second = (1 / time_s * self.batch_size ) if total_time_ms != np.inf else 0
 
                 # store the result
-                decode_benchmark[(island_id, range_idx)] = request_per_second 
+                decode_benchmark[(island_id, range_id)] = request_per_second 
 
         # print the results
         if print_debug:
             print("\n=== Ranges ===")
-            for range_idx, range in ranges.items():
-                print(f"Range {range_idx}: {range['sequence_length']} tokens, Probability: {range['probability']:.4f}, Range: {range['min']}-{range['max']} tokens")
+            for range_id, range in ranges.items():
+                print(f"Range {range_id}: {range['sequence_length']} tokens, Probability: {range['probability']:.4f}, Range: {range['min']}-{range['max']} tokens")
 
             print("\n=== Prefill Benchmark ===")
-            for island_id, range_idx in prefill_benchmark.keys():
-                print(f"Island {island_id}, Range {range_idx}: {prefill_benchmark[(island_id, range_idx)]:.4f} requests/s")
+            for island_id, range_id in prefill_benchmark.keys():
+                print(f"Island {island_id}, Range {range_id}: {prefill_benchmark[(island_id, range_id)]:.4f} requests/s")
 
             print("\n=== Decode Benchmark ===")
-            for island_id, range_idx in decode_benchmark.keys():
-                print(f"Island {island_id}, Range {range_idx}: {decode_benchmark[(island_id, range_idx)]:.4f} requests/s")
+            for island_id, range_id in decode_benchmark.keys():
+                print(f"Island {island_id}, Range {range_id}: {decode_benchmark[(island_id, range_id)]:.4f} requests/s")
 
         # extract Island IDs and sequence lengths
         island_ids = [island_id for island_id, _ in islands.items()]
-        range_ids = [range_idx for range_idx in ranges.keys()]
+        range_ids = [range_id for range_id in ranges.keys()]
         
         # create the problem
         print("*** Creating Problem ***")
@@ -173,15 +173,44 @@ class Packer:
         z = pulp.LpVariable.dicts("z", island_ids, cat='Binary')
 
         # constraints
-        tau = 0.01
-        M = 1000
+        tau = 0.1
+        M = 100
         lambda_dev = {j: M/(1 + ranges[j]['probability']) for j in range_ids}
 
-        # each island does either decode or prefill and
-        for island_id in island_ids:
-            problem += pulp.lpSum(x_decode[island_id][j] for j in range_ids) <= z[island_id], f"DecodeRole_{island_id}"
-            problem += pulp.lpSum(x_prefill[island_id][j] for j in range_ids) <= 1 - z[island_id], f"PrefillRole_{island_id}"
-            problem += pulp.lpSum(x_decode[island_id][j] + x_prefill[island_id][j] for j in range_ids) == 1, f"TotalLoad_{island_id}"
+        # prevent zero assignments if the benchmark is zero
+        for i in island_ids:
+            for j in range_ids:
+                if prefill_benchmark[(i, j)] == 0:
+                    x_prefill[i][j].upBound = 0
+                if decode_benchmark[(i, j)] == 0:
+                    x_decode[i][j].upBound = 0
+
+        ## each island does either decode or prefill and
+        #for island_id in island_ids:
+        #    problem += pulp.lpSum(x_decode[island_id][j] for j in range_ids) <= z[island_id], f"DecodeRole_{island_id}"
+        #    problem += pulp.lpSum(x_prefill[island_id][j] for j in range_ids) <= 1 - z[island_id], f"PrefillRole_{island_id}"
+        #    problem += pulp.lpSum(x_decode[island_id][j] + x_prefill[island_id][j] for j in range_ids) == 1, f"TotalLoad_{island_id}"
+            
+        # each island picks exactly one (mode, range), and is either decode or prefill
+        for i in island_ids:
+            # 1) each island must assign exactly one unit of load
+            problem += (
+                pulp.lpSum(x_decode[i][j] + x_prefill[i][j]
+                        for j in range_ids) == 1,
+                f"TotalLoad_{i}"
+            )
+            # 2) tight Big-M per (i,j):
+            for j in range_ids:
+                # if z[i] = 1 (decode island) → x_prefill[i,j] = 0
+                problem += (
+                    x_prefill[i][j] <= (1 - z[i]),
+                    f"link_prefill_{i}_{j}"
+                )
+                # if z[i] = 0 (prefill island) → x_decode[i,j] = 0
+                problem += (
+                    x_decode[i][j] <= z[i],
+                    f"link_decode_{i}_{j}"
+                )
                 
         # define Rj and R totals
         for j in range_ids:
@@ -223,7 +252,7 @@ class Packer:
         # objective function
         problem += (
             R_decode + R_prefill
-            - pulp.lpSum(lambda_dev[j] * (delta_decode[j] + delta_prefill[j] + delta_match[j]) for j in range_ids)
+            - pulp.lpSum((lambda_dev[j] * delta_match[j]) + delta_decode[j] + delta_prefill[j] for j in range_ids)
         ), "Objective"
 
         # solve
@@ -236,25 +265,25 @@ class Packer:
         if print_debug:
             print("\n=== Prefill Allocations ===")
             for island_id in island_ids:
-                for range_idx in range_ids:
-                    print(f"  Island {island_id}, Range {range_idx}: {x_prefill[island_id][range_idx].varValue:.4f} requests/s")
+                for range_id in range_ids:
+                    print(f"  Island {island_id}, Range {range_id}: {x_prefill[island_id][range_id].varValue:.4f} requests/s")
 
             print("\n=== Decode Allocations ===")
             for island_id in island_ids:
-                for range_idx in range_ids:
-                    print(f"  Island {island_id}, Range {range_idx}: {x_decode[island_id][range_idx].varValue:.4f} requests/s")
+                for range_id in range_ids:
+                    print(f"  Island {island_id}, Range {range_id}: {x_decode[island_id][range_id].varValue:.4f} requests/s")
 
             print("\n=== Prefill Range performance and deviation ===")
-            for range_idx in range_ids:
-                rj = Rj_prefill[range_idx].varValue
-                dj = delta_prefill[range_idx].varValue
-                print(f"  j={range_idx}: Rj={rj:.4f}, δ={dj:.4f}  (target {ranges[range_idx]['probability'] * R_prefill.varValue:.4f})")
+            for range_id in range_ids:
+                rj = Rj_prefill[range_id].varValue
+                dj = delta_prefill[range_id].varValue
+                print(f"  j={range_id}: Rj={rj:.4f}, δ={dj:.4f}  (target {ranges[range_id]['probability'] * R_prefill.varValue:.4f})")
 
             print("\n=== Decode Range performance and deviation ===")
-            for range_idx in range_ids:
-                rj = Rj_decode[range_idx].varValue
-                dj = delta_decode[range_idx].varValue
-                print(f"  j={range_idx}: Rj={rj:.4f}, δ={dj:.4f}  (target {ranges[range_idx]['probability'] * R_decode.varValue:.4f})")
+            for range_id in range_ids:
+                rj = Rj_decode[range_id].varValue
+                dj = delta_decode[range_id].varValue
+                print(f"  j={range_id}: Rj={rj:.4f}, δ={dj:.4f}  (target {ranges[range_id]['probability'] * R_decode.varValue:.4f})")
 
         # check if the problem is infeasible
         if pulp.LpStatus[problem.status] == "Infeasible":
@@ -262,30 +291,29 @@ class Packer:
             return None, None, None, None, None
 
         # extract the assignment
+        modes = {}
         prefill_assignment = {}
         decode_assignment = {}
         for island_id in island_ids:
-            for range_idx in range_ids:
-                # check if the variable is assigned
-                if x_prefill[island_id][range_idx].varValue > 0:
-                    prefill_assignment[(island_id, range_idx)] = x_prefill[island_id][range_idx].varValue
-                if x_decode[island_id][range_idx].varValue > 0:
-                    decode_assignment[(island_id, range_idx)] = x_decode[island_id][range_idx].varValue
+            for range_id in range_ids:
+                modes[(island_id, range_id)] = z[island_id].varValue
+                prefill_assignment[(island_id, range_id)] = x_prefill[island_id][range_id].varValue
+                decode_assignment[(island_id, range_id)] = x_decode[island_id][range_id].varValue
 
                 # throw an error if both are assigned
-                if x_prefill[island_id][range_idx].varValue > 0 and x_decode[island_id][range_idx].varValue > 0:
-                    raise ValueError(f"Both prefill and decode are assigned for island {island_id} and range {range_idx}.")
+                if x_prefill[island_id][range_id].varValue > 0 and x_decode[island_id][range_id].varValue > 0:
+                    raise ValueError(f"Both prefill and decode are assigned for island {island_id} and range {range_id}.")
 
         # extract the throughput and deviation
         prefill_throughput = {}
         prefill_deviation = {}
         decode_throughput = {}
         decode_deviation = {}
-        for range_idx in range_ids:
-            prefill_throughput[range_idx] = Rj_prefill[range_idx].varValue
-            prefill_deviation[range_idx] = delta_prefill[range_idx].varValue
-            decode_throughput[range_idx] = Rj_decode[range_idx].varValue
-            decode_deviation[range_idx] = delta_decode[range_idx].varValue
+        for range_id in range_ids:
+            prefill_throughput[range_id] = Rj_prefill[range_id].varValue
+            prefill_deviation[range_id] = delta_prefill[range_id].varValue
+            decode_throughput[range_id] = Rj_decode[range_id].varValue
+            decode_deviation[range_id] = delta_decode[range_id].varValue
 
         # construct model
         model = {
@@ -294,12 +322,15 @@ class Packer:
                 'assignment': prefill_assignment,
                 'throughput': prefill_throughput,
                 'deviation': prefill_deviation,
+                'benchmark': prefill_benchmark,
             },
             'decode': {
                 'assignment': decode_assignment,
                 'throughput': decode_throughput,
                 'deviation': decode_deviation,
+                'benchmark': decode_benchmark,
             },
+            'modes': modes,
         }
 
         if True:
@@ -327,14 +358,29 @@ if __name__ == "__main__":
 
     # Define bins and slots
     islands = [
-        evaluator.Island(gpu_type="RubinU-NVL576", dp=2, tp=4, size=1, id="island_1"),
-        evaluator.Island(gpu_type="RubinU-NVL576", dp=2, tp=4, size=2, id="island_2"),
-        evaluator.Island(gpu_type="RubinU-NVL576", dp=2, tp=4, size=4, id="island_3"),
-        evaluator.Island(gpu_type="RubinU-NVL576", dp=1, tp=8, size=128, id="island_4"),
-        evaluator.Island(gpu_type="H200", dp=1, tp=8, size=128, id="island_5"),
-        evaluator.Island(gpu_type="H800", dp=1, tp=8, size=128, id="island_6"),
-        evaluator.Island(gpu_type="H20", dp=1, tp=8, size=128, id="island_7"),
-        evaluator.Island(gpu_type="H20", dp=1, tp=8, size=128, id="island_8"),
+        evaluator.Island(gpu_type="RubinU-NVL576", dp=1, tp=1, size=1, id="a"),
+        evaluator.Island(gpu_type="RubinU-NVL576", dp=2, tp=1, size=1, id="b"),
+        evaluator.Island(gpu_type="RubinU-NVL576", dp=4, tp=1, size=1, id="c"),
+        evaluator.Island(gpu_type="RubinU-NVL576", dp=1, tp=2, size=1, id="d"),
+        evaluator.Island(gpu_type="RubinU-NVL576", dp=2, tp=2, size=1, id="e"),
+        evaluator.Island(gpu_type="RubinU-NVL576", dp=4, tp=2, size=1, id="f"),
+        evaluator.Island(gpu_type="RubinU-NVL576", dp=1, tp=4, size=1, id="g"),
+        evaluator.Island(gpu_type="RubinU-NVL576", dp=2, tp=4, size=1, id="h"),
+        evaluator.Island(gpu_type="RubinU-NVL576", dp=4, tp=4, size=1, id="i"),
+        evaluator.Island(gpu_type="RubinU-NVL576", dp=4, tp=2, size=128, id="j"),
+        evaluator.Island(gpu_type="RubinU-NVL576", dp=4, tp=4, size=128, id="k"),
+        evaluator.Island(gpu_type="RubinU-NVL576", dp=4, tp=8, size=128, id="l"),
+        evaluator.Island(gpu_type="H200", dp=1, tp=1, size=1, id="m"),
+        evaluator.Island(gpu_type="H200", dp=2, tp=1, size=1, id="n"),
+        evaluator.Island(gpu_type="H200", dp=4, tp=1, size=1, id="o"),
+        evaluator.Island(gpu_type="H200", dp=1, tp=2, size=1, id="p"),
+        evaluator.Island(gpu_type="H200", dp=2, tp=2, size=1, id="q"),
+        evaluator.Island(gpu_type="H20", dp=4, tp=2, size=1, id="r"),
+        evaluator.Island(gpu_type="H20", dp=4, tp=4, size=1, id="s"),
+        evaluator.Island(gpu_type="H20", dp=4, tp=8, size=1, id="t"),
+        evaluator.Island(gpu_type="H800", dp=4, tp=2, size=64, id="u"),
+        evaluator.Island(gpu_type="H800", dp=4, tp=4, size=64, id="v"),
+        evaluator.Island(gpu_type="H800", dp=4, tp=8, size=64, id="w"),
     ]
     islands = {island.id: island for island in islands}
 
@@ -342,7 +388,7 @@ if __name__ == "__main__":
     trace_pdf = evaluator.load_trace_pdf("traces/generated_trace_pdf.csv")
 
     # Pack the prefill bins
-    model, prefill_throughput, decode_throughput, delta, objective = packer.solve_linear(islands, trace_pdf, resolution=10, print_debug=False)
+    model, prefill_throughput, decode_throughput, delta, objective = packer.solve_linear(islands, trace_pdf, resolution=100, print_debug=False)
 
     # check if the model is not None
     if model is not None:
@@ -353,22 +399,22 @@ if __name__ == "__main__":
         print(f"Objective: {objective:.4f}")
 
         # add assignments to the islands
-        for (island_id, range_idx), value in model['prefill']['assignment'].items():
+        for (island_id, range_id), value in model['prefill']['assignment'].items():
             islands[island_id].assign_prefill(
                 (
                     evaluator.Bin(
-                        min=model['ranges'][range_idx]['min'],
-                        max=model['ranges'][range_idx]['max'],
+                        min=model['ranges'][range_id]['min'],
+                        max=model['ranges'][range_id]['max'],
                     ),
                     value
                 )
             )
-        for (island_id, range_idx), value in model['decode']['assignment'].items():
+        for (island_id, range_id), value in model['decode']['assignment'].items():
             islands[island_id].assign_decode(
                 (
                     evaluator.Bin(
-                        min=model['ranges'][range_idx]['min'],
-                        max=model['ranges'][range_idx]['max'],
+                        min=model['ranges'][range_id]['min'],
+                        max=model['ranges'][range_id]['max'],
                     ),
                     value
                 )
@@ -377,21 +423,20 @@ if __name__ == "__main__":
         # save model throughputs values to csv
         with open("./data/scratch/model_prefill_throughput.csv", "w") as f:
             f.write("Sequence,Throughput\n")
-            for range_idx, throughput in model['prefill']['throughput'].items():
-                f.write(f"{model['ranges'][range_idx]['sequence_length']},{throughput}\n")
+            for range_id, throughput in model['prefill']['throughput'].items():
+                f.write(f"{model['ranges'][range_id]['sequence_length']},{throughput}\n")
         with open("./data/scratch/model_decode_throughput.csv", "w") as f:
             f.write("Sequence,Throughput\n")
-            for range_idx, throughput in model['decode']['throughput'].items():
-                f.write(f"{model['ranges'][range_idx]['sequence_length']},{throughput}\n")
+            for range_id, throughput in model['decode']['throughput'].items():
+                f.write(f"{model['ranges'][range_id]['sequence_length']},{throughput}\n")
 
         # save the assignment to a csv
         with open("./data/scratch/model_assignment.csv", "w") as f:
-            f.write("Island,Range,Prefill,Decode\n")
-            for (island_id, range_idx), value in model['prefill']['assignment'].items():
-                f.write(f"{island_id},{range_idx},{value},0\n")
-            for (island_id, range_idx), value in model['decode']['assignment'].items():
-                f.write(f"{island_id},{range_idx},0,{value}\n")
-
+            f.write("Island,Range,Prefill_Assignment,Decode_Assignment,Prefill_Benchmark,Decode_Benchmark,Prefill_Assignment_Benchmark,Decode_Assignment_Benchmark,Mode\n")
+            for island_id in islands.keys():
+                for range_id in model['ranges'].keys():
+                    f.write(f"{island_id},{range_id},{model['prefill']['assignment'][(island_id, range_id)]},{model['decode']['assignment'][(island_id, range_id)]},{model['prefill']['benchmark'][(island_id, range_id)]},{model['decode']['benchmark'][(island_id, range_id)]},{model['prefill']['assignment'][(island_id, range_id)] * model['prefill']['benchmark'][(island_id, range_id)]},{model['decode']['assignment'][(island_id, range_id)] * model['decode']['benchmark'][(island_id, range_id)]},{model['modes'][(island_id, range_id)]}\n")
+                
         # pass to evaluator
         evaluator = evaluator.Evaluator(gpu_types)
         prefill_throughput, decode_throughput = evaluator.evaluate(islands, trace_pdf, print_debug=False)
