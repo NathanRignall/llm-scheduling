@@ -8,6 +8,7 @@ import evaluator
 
 class Packer:
     def __init__(self, gpu_types):
+        # core variables
         self.gpu_types = gpu_types
         self.args = simulator.ModelArgs()
         self.prefill_gpu_list = simulator.get_gpu_info('./device/gpu_info.csv', decoding_mode=False, device_list=gpu_types, discount_rate=0.85)
@@ -15,220 +16,25 @@ class Packer:
         self.decode_len_avg = 100
         self.decode_len_max = 1000
 
+        # cache variables
+        self.ranges_cache = {}
+        self.prefill_config_cache = {}
+        self.decode_config_cache = {}
+
     def solve_linear(self, islands, trace_pdf, resolution=10, print_debug=True):
         print("\n=== Packer ===")
 
+        # form ranges from the trace PDF
         print("*** Forming Ranges ***")
-        # store probabilities
-        ranges = {}
-        range_id = 0
-        total_probability = 0
-
-        # check every sequence length, sample at the midpoint of each resolution interval
-        for idx, sequence_length in enumerate(trace_pdf[0]):
-            midpoint = resolution // 2
-            if idx % resolution == midpoint:
-                # compute the probability of the bin (sum of all bins in range)
-                bin_start = idx - midpoint
-                bin_end = bin_start + resolution
-                probability = np.sum(trace_pdf[1][bin_start:bin_end])
-
-                # store the probability
-                ranges[range_id] = {
-                    'sequence_length': sequence_length,
-                    'probability': probability,
-                    'min': bin_start,
-                    'max': bin_end,
-                }
-
-                # increment total probability
-                total_probability += probability
-
-                # increment the range index
-                range_id += 1
-
-        # check if the total probability is equal to 1
-        if print_debug:
-            print(f"Total probability: {total_probability:.4f}")
+        ranges = self.form_ranges(trace_pdf, resolution)
 
         # for each island, find the best gpu configuration during prefill
         print("*** Prefill GPU Config ***")
-        prefill_configs = {}
-        for index, (island_id, island) in enumerate(islands.items()):
-            # create a list of configurations for the island to test
-            configs = []
-            for tp in builtins.range(1, 8 + 1):
-                if island.size % tp == 0:
-                    dp = island.size // tp
-                    configs.append((tp, dp))
+        prefill_configs = self.get_prefill_config(islands, ranges)
 
-            # for each range, test the configurations
-            results = []
-            for range_id, range in ranges.items():
-                # compute the throughput for each configuration
-                for tp, dp in configs:
-                    time_ms = simulator.prefill_time(
-                        self.args,
-                        self.prefill_gpu_list[island.gpu_type],
-                        range['sequence_length'],
-                        kv_cache_rate=1,
-                        tp_num=tp,
-                        dp_num=dp
-                    )
-
-                    time_s = time_ms / 1000
-                    request_per_second = 1 / time_s
-
-                    # store the result
-                    results.append({
-                        'tp': tp,
-                        'dp': dp,
-                        'range_id': range_id,
-                        'throughput': request_per_second,
-                    })
-
-            # make a df of the results
-            results_df = pd.DataFrame(results)
-
-            # calculate the percentage difference between the best and each configuration for each range
-            best_configs = results_df.loc[results_df.groupby('range_id')['throughput'].idxmax()]
-
-            # calculate delta (percentage difference) between the best config and the others
-            def calculate_delta(row, best_row):
-                if best_row['throughput'] == 0:
-                    return 0
-                return (row['throughput'] - best_row['throughput']) / best_row['throughput'] * 100
-
-            # Add delta column to the DataFrame
-            results_df['delta'] = results_df.apply(
-                lambda row: calculate_delta(row, best_configs[best_configs['range_id'] == row['range_id']].iloc[0]),
-                axis=1
-            )
-
-            # Calculate the average delta for each configuration
-            avg_deltas = results_df.groupby(['tp', 'dp'])['delta'].mean().reset_index()
-
-            # Find the configuration with the minimum average delta
-            best_config = avg_deltas.loc[avg_deltas['delta'].idxmin()]
-
-            # extract all the throughput values for the best configuration
-            best_config_ranges = results_df[(results_df['tp'] == best_config['tp']) & (results_df['dp'] == best_config['dp'])]
-            best_config_ranges = best_config_ranges[['range_id', 'throughput']].set_index('range_id').to_dict()['throughput']
-
-            prefill_configs[island_id] = {
-                'tp': best_config['tp'],
-                'dp': best_config['dp'],
-                'ranges': best_config_ranges,
-            }
-
-        # for each island, find the best gpu configuration during decode
+        # # for each island, find the best gpu configuration during decode
         print("*** Decode GPU Config ***")
-        decode_configs = {}
-        for index, (island_id, island) in enumerate(islands.items()):
-            # calculate variants of tp and dp
-            tp_list = []
-            dp_list = []
-            for tp in builtins.range(1, 8 + 1):
-                if island.size % tp == 0:
-                    tp_list.append(tp)
-            for dp in builtins.range(1, 8 + 1):
-                if island.size % dp == 0:
-                    dp_list.append(dp)
-
-            # for each range, test the configurations
-            results = []
-            for range_id, range in ranges.items():
-                # compute the throughput for each configuration
-                for tp in tp_list:
-                    for dp in dp_list:
-                        loop_num_gpus = island.size // dp
-
-                        max_bs = simulator.check_max_bs(
-                            self.args,
-                            self.decode_gpu_list[island.gpu_type],
-                            tp_num=tp,
-                            seq_len=range['max'],
-                            decode_len=self.decode_len_max,
-                            gemm_group_per_device=math.ceil(self.args.n_routed_experts / loop_num_gpus),
-                            device_num=loop_num_gpus,
-                        )
-
-                        # round max bs to the nearest multiple of 8, maximum 1024, minimum 8
-                        max_bs = min(max_bs, 1024)
-                        batch_size = max_bs - (max_bs % 8)
-                        batch_size = max(batch_size, 8)
-
-                        total_time_ms = 0
-                        for current_decode_length in builtins.range(1, self.decode_len_avg, 1):
-                            time_ms, _ = simulator.decode_time(
-                                self.args,
-                                self.decode_gpu_list[island.gpu_type],
-                                tp_num=tp,
-                                bs_num=batch_size,
-                                seq_len=range['sequence_length'] + current_decode_length,
-                                decode_len=self.decode_len_avg - current_decode_length,
-                                gemm_group_per_device=math.ceil(self.args.n_routed_experts / loop_num_gpus),
-                                device_num=loop_num_gpus,
-                            )
-
-                            # don't continue if the time is infinite
-                            if time_ms == np.inf:
-                                total_time_ms = np.inf
-                                break
-                            else:
-                                total_time_ms += time_ms
-
-                        time_s = total_time_ms / 1000
-                        request_per_second = (1 / time_s * batch_size ) * dp if total_time_ms != np.inf else 0
-
-                        # store the result
-                        results.append({
-                            'tp': tp,
-                            'dp': dp,
-                            'range_id': range_id,
-                            'throughput': request_per_second,
-                            'batch_size': batch_size,
-                        })
-
-            # make a df of the results
-            results_df = pd.DataFrame(results)
-
-            # calculate the percentage difference between the best and each configuration for each range
-            best_configs = results_df.loc[results_df.groupby('range_id')['throughput'].idxmax()]
-
-            # calculate delta (percentage difference) between the best config and the others
-            def calculate_delta(row, best_row):
-                if best_row['throughput'] == 0:
-                    return 0
-                return (row['throughput'] - best_row['throughput']) / best_row['throughput'] * 100
-            
-            # Add delta column to the DataFrame
-            results_df['delta'] = results_df.apply(
-                lambda row: calculate_delta(row, best_configs[best_configs['range_id'] == row['range_id']].iloc[0]),
-                axis=1
-            )
-
-            # Calculate the average delta for each configuration
-            avg_deltas = results_df.groupby(['tp', 'dp'])['delta'].mean().reset_index()
-
-            # Find the configuration with the minimum average delta
-            best_config = avg_deltas.loc[avg_deltas['delta'].idxmin()]
-
-            # extract a list of rangeIDs and batch sizes for the best configuration
-            best_config_ranges = results_df[(results_df['tp'] == best_config['tp']) & (results_df['dp'] == best_config['dp'])]
-
-            # extract throughput and batch_size for the best tp
-            best_config_ranges = (
-                best_config_ranges
-                .set_index('range_id')[['throughput', 'batch_size']]
-                .to_dict(orient='index')
-            )
-
-            decode_configs[island_id] = {
-                'tp': best_config['tp'],
-                'dp': best_config['dp'],
-                'ranges': best_config_ranges,
-            }
+        decode_configs = self.get_decode_config(islands, ranges)
 
         # print the results
         if print_debug:
@@ -442,49 +248,264 @@ class Packer:
 
         # return the assignment
         return model, pulp.value(R_prefill), pulp.value(R_decode), pulp.value(D_total), pulp.value(problem.objective)
+    
+    def form_ranges(self, trace_pdf, resolution):
+        # check if the trace PDF is already cached for the given resolution
+        if (tuple(trace_pdf[0]), resolution) in self.ranges_cache:
+            return self.ranges_cache[(tuple(trace_pdf[0]), resolution)]
+
+        # form ranges from the trace PDF
+        ranges = {}
+        range_id = 0
+        total_probability = 0
+
+        # check every sequence length, sample at the midpoint of each resolution interval
+        for idx, sequence_length in enumerate(trace_pdf[0]):
+            midpoint = resolution // 2
+            if idx % resolution == midpoint:
+                # compute the probability of the bin (sum of all bins in range)
+                bin_start = idx - midpoint
+                bin_end = bin_start + resolution
+                probability = np.sum(trace_pdf[1][bin_start:bin_end])
+
+                # store the probability
+                ranges[range_id] = {
+                    'sequence_length': sequence_length,
+                    'probability': probability,
+                    'min': bin_start,
+                    'max': bin_end,
+                }
+
+                # increment total probability
+                total_probability += probability
+
+                # increment the range index
+                range_id += 1
+
+        # add to the cache
+        self.ranges_cache[(tuple(trace_pdf[0]), resolution)] = ranges
+
+        return ranges
+
+    def get_prefill_config(self, islands, ranges):
+        prefill_configs = {}
+        for index, (island_id, island) in enumerate(islands.items()):
+            # check if the configuration is already cached
+            if f"{island.gpu_type}_{island.size}" in self.prefill_config_cache:
+                prefill_configs[island_id] = self.prefill_config_cache[f"{island.gpu_type}_{island.size}"]
+                continue
+
+            # create a list of configurations for the island to test
+            configs = []
+            for tp in builtins.range(1, 8 + 1):
+                if island.size % tp == 0:
+                    dp = island.size // tp
+                    configs.append((tp, dp))
+
+            # for each range, test the configurations
+            results = []
+            for range_id, range in ranges.items():
+                # compute the throughput for each configuration
+                for tp, dp in configs:
+                    time_ms = simulator.prefill_time(
+                        self.args,
+                        self.prefill_gpu_list[island.gpu_type],
+                        range['sequence_length'],
+                        kv_cache_rate=1,
+                        tp_num=tp,
+                        dp_num=dp
+                    )
+
+                    time_s = time_ms / 1000
+                    request_per_second = 1 / time_s
+
+                    # store the result
+                    results.append({
+                        'tp': tp,
+                        'dp': dp,
+                        'range_id': range_id,
+                        'throughput': request_per_second,
+                    })
+
+            # make a df of the results
+            results_df = pd.DataFrame(results)
+
+            # calculate the percentage difference between the best and each configuration for each range
+            best_configs = results_df.loc[results_df.groupby('range_id')['throughput'].idxmax()]
+
+            # calculate delta (percentage difference) between the best config and the others
+            def calculate_delta(row, best_row):
+                if best_row['throughput'] == 0:
+                    return 0
+                return (row['throughput'] - best_row['throughput']) / best_row['throughput'] * 100
+
+            # Add delta column to the DataFrame
+            results_df['delta'] = results_df.apply(
+                lambda row: calculate_delta(row, best_configs[best_configs['range_id'] == row['range_id']].iloc[0]),
+                axis=1
+            )
+
+            # Calculate the average delta for each configuration
+            avg_deltas = results_df.groupby(['tp', 'dp'])['delta'].mean().reset_index()
+
+            # Find the configuration with the minimum average delta
+            best_config = avg_deltas.loc[avg_deltas['delta'].idxmin()]
+
+            # extract all the throughput values for the best configuration
+            best_config_ranges = results_df[(results_df['tp'] == best_config['tp']) & (results_df['dp'] == best_config['dp'])]
+            best_config_ranges = best_config_ranges[['range_id', 'throughput']].set_index('range_id').to_dict()['throughput']
+
+            prefill_configs[island_id] = {
+                'tp': best_config['tp'],
+                'dp': best_config['dp'],
+                'ranges': best_config_ranges,
+            }
+
+            # cache the configuration
+            self.prefill_config_cache[f"{island.gpu_type}_{island.size}"] = prefill_configs[island_id]
+
+        return prefill_configs
+
+    def get_decode_config(self, islands, ranges):
+        # for each island, find the best gpu configuration during decode
+        decode_configs = {}
+        for index, (island_id, island) in enumerate(islands.items()):
+            # check if the configuration is already cached
+            if f"{island.gpu_type}_{island.size}" in self.decode_config_cache:
+                decode_configs[island_id] = self.decode_config_cache[f"{island.gpu_type}_{island.size}"]
+                continue
+
+            # calculate variants of tp and dp
+            tp_list = []
+            dp_list = []
+            for tp in builtins.range(1, 8 + 1):
+                if island.size % tp == 0:
+                    tp_list.append(tp)
+            for dp in builtins.range(1, 8 + 1):
+                if island.size % dp == 0:
+                    dp_list.append(dp)
+
+            # for each range, test the configurations
+            results = []
+            for range_id, range in ranges.items():
+                # compute the throughput for each configuration
+                for tp in tp_list:
+                    for dp in dp_list:
+                        loop_num_gpus = island.size // dp
+
+                        max_bs = simulator.check_max_bs(
+                            self.args,
+                            self.decode_gpu_list[island.gpu_type],
+                            tp_num=tp,
+                            seq_len=range['max'],
+                            decode_len=self.decode_len_max,
+                            gemm_group_per_device=math.ceil(self.args.n_routed_experts / loop_num_gpus),
+                            device_num=loop_num_gpus,
+                        )
+
+                        # round max bs to the nearest multiple of 8, maximum 1024, minimum 8
+                        max_bs = min(max_bs, 1024)
+                        batch_size = max_bs - (max_bs % 8)
+                        batch_size = max(batch_size, 8)
+
+                        total_time_ms = 0
+                        for current_decode_length in builtins.range(1, self.decode_len_avg, 1):
+                            time_ms, _ = simulator.decode_time(
+                                self.args,
+                                self.decode_gpu_list[island.gpu_type],
+                                tp_num=tp,
+                                bs_num=batch_size,
+                                seq_len=range['sequence_length'] + current_decode_length,
+                                decode_len=self.decode_len_avg - current_decode_length,
+                                gemm_group_per_device=math.ceil(self.args.n_routed_experts / loop_num_gpus),
+                                device_num=loop_num_gpus,
+                            )
+
+                            # don't continue if the time is infinite
+                            if time_ms == np.inf:
+                                total_time_ms = np.inf
+                                break
+                            else:
+                                total_time_ms += time_ms
+
+                        time_s = total_time_ms / 1000
+                        request_per_second = (1 / time_s * batch_size ) * dp if total_time_ms != np.inf else 0
+
+                        # store the result
+                        results.append({
+                            'tp': tp,
+                            'dp': dp,
+                            'range_id': range_id,
+                            'throughput': request_per_second,
+                            'batch_size': batch_size,
+                        })
+
+            # make a df of the results
+            results_df = pd.DataFrame(results)
+
+            # calculate the percentage difference between the best and each configuration for each range
+            best_configs = results_df.loc[results_df.groupby('range_id')['throughput'].idxmax()]
+
+            # calculate delta (percentage difference) between the best config and the others
+            def calculate_delta(row, best_row):
+                if best_row['throughput'] == 0:
+                    return 0
+                return (row['throughput'] - best_row['throughput']) / best_row['throughput'] * 100
+            
+            # Add delta column to the DataFrame
+            results_df['delta'] = results_df.apply(
+                lambda row: calculate_delta(row, best_configs[best_configs['range_id'] == row['range_id']].iloc[0]),
+                axis=1
+            )
+
+            # Calculate the average delta for each configuration
+            avg_deltas = results_df.groupby(['tp', 'dp'])['delta'].mean().reset_index()
+
+            # Find the configuration with the minimum average delta
+            best_config = avg_deltas.loc[avg_deltas['delta'].idxmin()]
+
+            # extract a list of rangeIDs and batch sizes for the best configuration
+            best_config_ranges = results_df[(results_df['tp'] == best_config['tp']) & (results_df['dp'] == best_config['dp'])]
+
+            # extract throughput and batch_size for the best tp
+            best_config_ranges = (
+                best_config_ranges
+                .set_index('range_id')[['throughput', 'batch_size']]
+                .to_dict(orient='index')
+            )
+
+            decode_configs[island_id] = {
+                'tp': best_config['tp'],
+                'dp': best_config['dp'],
+                'ranges': best_config_ranges,
+            }
+
+            # cache the configuration
+            self.decode_config_cache[f"{island.gpu_type}_{island.size}"] = decode_configs[island_id]
+
+        return decode_configs
 
 # Example usage
 if __name__ == "__main__":
-    gpu_types = ["RubinU-NVL576", "H200", "H800", "H20"]
+    gpu_types = ["RubinU-NVL576", "H800", "H20"]
 
     # Create a packer instance
     packer = Packer(gpu_types)
 
     # Define bins and slots
     islands = [
-        evaluator.Island(gpu_type="RubinU-NVL576", size=16, id="a"),
+        evaluator.Island(gpu_type="RubinU-NVL576", size=8, id="a"),
         evaluator.Island(gpu_type="RubinU-NVL576", size=16, id="b"),
-        evaluator.Island(gpu_type="RubinU-NVL576", size=16, id="c"),
-        evaluator.Island(gpu_type="RubinU-NVL576", size=16, id="d"),
-        evaluator.Island(gpu_type="RubinU-NVL576", size=16, id="e"),
-        evaluator.Island(gpu_type="RubinU-NVL576", size=32, id="f"),
-        evaluator.Island(gpu_type="RubinU-NVL576", size=64, id="g"),
-        evaluator.Island(gpu_type="RubinU-NVL576", size=1024, id="h"),
-        evaluator.Island(gpu_type="H200", size=16, id="m"),
-        evaluator.Island(gpu_type="H200", size=16, id="n"),
-        evaluator.Island(gpu_type="H200", size=16, id="o"),
-        evaluator.Island(gpu_type="H200", size=16, id="p"),
-        evaluator.Island(gpu_type="H20", size=16, id="q"),
-        evaluator.Island(gpu_type="H20", size=16, id="r"),
-        evaluator.Island(gpu_type="H20", size=16, id="s"),
-        evaluator.Island(gpu_type="H20", size=16, id="t"),
-        evaluator.Island(gpu_type="H800", size=16, id="u"),
-        evaluator.Island(gpu_type="H800", size=16, id="v"),
-        evaluator.Island(gpu_type="H800", size=16, id="w"),
-        evaluator.Island(gpu_type="H800", size=16, id="x"),
-        evaluator.Island(gpu_type="H800", size=16, id="y"),
-        evaluator.Island(gpu_type="H800", size=16, id="z"),
-        evaluator.Island(gpu_type="H800", size=16, id="aa"),
-        evaluator.Island(gpu_type="H800", size=16, id="ab"),
-        evaluator.Island(gpu_type="H800", size=16, id="ac"),
-        evaluator.Island(gpu_type="H800", size=16, id="ad"),
-        evaluator.Island(gpu_type="H800", size=16, id="ae"),
-        evaluator.Island(gpu_type="H800", size=16, id="af"),
-        evaluator.Island(gpu_type="H800", size=16, id="ag"),
-        evaluator.Island(gpu_type="H800", size=16, id="ah"),
-        evaluator.Island(gpu_type="H800", size=16, id="ai"),
-        evaluator.Island(gpu_type="H800", size=16, id="aj"),
-        evaluator.Island(gpu_type="H800", size=16, id="ak"),
+        evaluator.Island(gpu_type="RubinU-NVL576", size=32, id="c"),
+        evaluator.Island(gpu_type="RubinU-NVL576", size=64, id="d"),
+        evaluator.Island(gpu_type="H800", size=8, id="e"),
+        evaluator.Island(gpu_type="H800", size=16, id="f"),
+        evaluator.Island(gpu_type="H800", size=32, id="g"),
+        evaluator.Island(gpu_type="H800", size=64, id="h"),
+        evaluator.Island(gpu_type="H20", size=8, id="i"),
+        evaluator.Island(gpu_type="H20", size=16, id="j"),
+        evaluator.Island(gpu_type="H20", size=32, id="k"),
+        evaluator.Island(gpu_type="H20", size=64, id="l"),
     ]
     islands = {island.id: island for island in islands}
 
@@ -492,7 +513,7 @@ if __name__ == "__main__":
     trace_pdf = evaluator.load_trace_pdf("traces/generated_trace_pdf.csv")
 
     # Pack the prefill bins
-    model, prefill_throughput, decode_throughput, delta, objective = packer.solve_linear(islands, trace_pdf, resolution=500, print_debug=False)
+    model, prefill_throughput, decode_throughput, delta, objective = packer.solve_linear(islands, trace_pdf, resolution=100, print_debug=False)
 
     # check if the model is not None
     if model is not None:
