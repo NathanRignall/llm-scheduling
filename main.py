@@ -15,15 +15,14 @@ from ax.models.torch.botorch_modular.surrogate import Surrogate
 from ax.models.torch.botorch_modular.surrogate import SurrogateSpec, ModelConfig
 import numpy as np
 
-import numpy as np
-
 import packer
+import evaluator
 
 # --- Define search space ---
-K_SLOTS = 4
+K_SLOTS = 8
 
-GPU_TYPES = ["DGX-B300", "H20"]
-INVENTORY = {"DGX-B300": 32, "H20": 64}
+GPU_TYPES = ["DGX-B300", "H200"]
+INVENTORY = {"DGX-B300": 128, "H200": 256}
 
 pack = packer.Packer(
     gpu_types=GPU_TYPES,
@@ -31,6 +30,9 @@ pack = packer.Packer(
 
 parameters = []
 parameter_constraints = []
+
+# --- Define trace PDF ---
+trace_pdf = evaluator.load_trace_pdf("traces/generated_trace_pdf.csv")
 
 # Island slots
 for gpu_type in GPU_TYPES:
@@ -44,15 +46,9 @@ for gpu_type in GPU_TYPES:
             name=f"count_{gpu_type}_{k}", parameter_type=ParameterType.INT,
             lower=0, upper=INVENTORY[gpu_type],
         )
-        # GPU TP
-        gpu_tp = RangeParameter(
-            name=f"tp_{gpu_type}_{k}", parameter_type=ParameterType.INT,
-            lower=1, upper=4,
-        )
         
         # Add parameters to search space
         parameters.append(gpu_count)
-        parameters.append(gpu_tp)
 
         # Add to sum
         gpu_sum.append(gpu_count)
@@ -84,36 +80,40 @@ def eval_config_outer(params):
             print(f"ERROR - Configuration rejected: {gpu_type} used {total_count} > {INVENTORY[gpu_type]} available")
             return 1e9
 
-    slots = []
+    islands = []
     for gpu_type in GPU_TYPES:
         for k in range(K_SLOTS):
             # Extract island parameters
             count = params[f"count_{gpu_type}_{k}"]
-            tp = params[f"tp_{gpu_type}_{k}"]
-
-            # Calculate dp (count / tp, whole number)
-            dp = count // tp if tp > 0 else 0
 
             # Skip unused slots
-            if count <= 0 or tp <= 0 or dp <= 0:
-                print(f"Slot {k} not used: gpu_type={gpu_type}, count={count}, tp={tp}, dp={dp}")
+            if count <= 0:
+                #print(f"Slot {k} not used: gpu_type={gpu_type}, count={count}")
                 continue
-            print(f"Slot {k} used: gpu_type={gpu_type}, count={count}, tp={tp}, dp={dp}")
+            #print(f"Slot {k} used: gpu_type={gpu_type}, count={count}")
 
             # Create island
-            island = packer.Island(
+            island = evaluator.Island(
                 gpu_type=gpu_type,
-                role="prefill",
-                dp=dp,
-                tp=tp,
+                size=count,
             )
 
             # Add island to the list
-            slots.append(island)
+            islands.append(island)
+
+    # turn into dict
+    islands = {island.id: island for island in islands}
 
     # Evaluate configuration
-    prefill_speed = pack.solve_prefill(slots, 1000)
-    rho_max = prefill_speed if prefill_speed != np.inf else 1e9
+    model, prefill_throughput, decode_throughput, delta, objective =  pack.solve_linear(islands, trace_pdf, resolution=100, print_debug=False)
+
+    # pick lowest throughput if neither is None
+    if prefill_throughput is None or decode_throughput is None:
+        throughput = None
+    else:
+        throughput = min(prefill_throughput, decode_throughput)
+
+    rho_max = 1 / (throughput if throughput is not None else 1)
 
     print(f"***** rho_max = {rho_max:.2f} *****")
 
@@ -151,14 +151,9 @@ def generate_okay_configs(n_configs: int = 1):
             for k in range(K_SLOTS):
                 # Remaining budget for this gpu_type
                 remaining = INVENTORY[gpu_type] - total_used
-                # Randomly pick count in [0, remaining]
-                count = np.random.randint(0, remaining + 1)
-                # Pick a tp in [1, 4], but cap it to 'count'
-                tp = np.random.randint(1, 4)
-                tp = min(tp, count) if count > 0 else 0
 
+                count = np.random.randint(0, remaining + 1)
                 cfg[f"count_{gpu_type}_{k}"] = count
-                cfg[f"tp_{gpu_type}_{k}"] = tp
 
                 total_used += count
 
@@ -167,7 +162,7 @@ def generate_okay_configs(n_configs: int = 1):
     return configs
 
 # Generate, for example, 3 warm‐start configurations
-initial_parameters = generate_okay_configs(n_configs=2)
+initial_parameters = generate_okay_configs(n_configs=5)
 
 def add_initial_arms(experiment, initial_parameters):
     for idx, params in enumerate(initial_parameters):
