@@ -88,9 +88,7 @@ def eval_config_outer(params):
 
             # Skip unused slots
             if count <= 0:
-                #print(f"Slot {k} not used: gpu_type={gpu_type}, count={count}")
                 continue
-            #print(f"Slot {k} used: gpu_type={gpu_type}, count={count}")
 
             # Create island
             island = evaluator.Island(
@@ -105,15 +103,16 @@ def eval_config_outer(params):
     islands = {island.id: island for island in islands}
 
     # Evaluate configuration
-    model, prefill_throughput, decode_throughput, delta, objective =  pack.solve_linear(islands, trace_pdf, resolution=100, print_debug=False)
+    _, prefill_throughput, decode_throughput, _, _ =  pack.solve_linear(islands, trace_pdf, resolution=100, print_debug=False)
 
     # pick lowest throughput if neither is None
     if prefill_throughput is None or decode_throughput is None:
-        throughput = None
-    else:
-        throughput = min(prefill_throughput, decode_throughput)
+        print("ERROR - Configuration rejected: prefill or decode throughput is None")
+        return 1e9
 
-    rho_max = 1 / (throughput if throughput is not None else 1)
+    # calculate rho_max
+    throughput = min(prefill_throughput, decode_throughput)
+    rho_max = 1 / throughput
 
     print(f"***** rho_max = {rho_max:.2f} *****")
 
@@ -179,9 +178,9 @@ data = experiment.fetch_data()
 
 # --- SAASBO loop ---
 BATCH_SIZE = 5
-NUM_SAMPLES = 256
-WARMUP_STEPS = 512
-N_BATCH = 10
+NUM_SAMPLES = 128
+WARMUP_STEPS = 256
+N_BATCH = 20
 
 model_config = ModelConfig(
     botorch_model_class=SaasFullyBayesianSingleTaskGP,
