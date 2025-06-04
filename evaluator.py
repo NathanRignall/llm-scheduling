@@ -30,11 +30,11 @@ class Bin:
         self.tp = tp
         self.bs = bs
 class Evaluator:
-    def __init__(self, gpu_types):
+    def __init__(self, gpu_types, gpu_info_file='./device/gpu_info.csv'):
         self.gpu_types = gpu_types
         self.args = simulator.ModelArgs()
-        self.prefill_gpu_list = simulator.get_gpu_info('./device/gpu_info.csv', decoding_mode=False, device_list=gpu_types, discount_rate=0.85)
-        self.decode_gpu_list = simulator.get_gpu_info('./device/gpu_info.csv', decoding_mode=True, device_list=gpu_types, discount_rate=0.85)
+        self.prefill_gpu_list = simulator.get_gpu_info(gpu_info_file, decoding_mode=False, device_list=gpu_types, discount_rate=0.85)
+        self.decode_gpu_list = simulator.get_gpu_info(gpu_info_file, decoding_mode=True, device_list=gpu_types, discount_rate=0.85)
         self.decode_len_avg = 100
         self.decode_len_max = 1000
 
