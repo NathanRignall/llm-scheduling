@@ -29,7 +29,7 @@ def test_config(islands, trace_pdf):
     total_gpus = sum(island.size for island in islands)
     print(f"Total GPUs in configuration: {total_gpus}")
 
-    # Convert islands to a format suitable for the packer
+    # turn into dict
     islands = {island.id: island for island in islands}
     
     # Pack the islands

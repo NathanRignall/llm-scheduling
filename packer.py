@@ -1,4 +1,5 @@
 import math
+import os
 import numpy as np
 import pandas as pd
 import pulp
@@ -302,6 +303,12 @@ class Packer:
                     dp = island.size // tp
                     configs.append((tp, dp))
 
+
+            # if either tp or dp is 0, throw and error and crash
+            for tp, dp in configs:
+                if tp == 0 or dp == 0:
+                    raise ValueError(f"Invalid configuration for island {island_id}: TP={tp}, DP={dp} (size={island.size}, gpu_type={island.gpu_type})")
+
             # for each range, test the configurations
             results = []
             for range_id, range in ranges.items():
@@ -485,44 +492,7 @@ class Packer:
 
         return decode_configs
 
-# Example usage
-if __name__ == "__main__":
-    gpu_types = ["RubinU-NVL576", "H800", "H20"]
-
-    # Create a packer instance
-    packer = Packer(gpu_types)
-
-    # Define bins and slots
-    islands = [
-        evaluator.Island(gpu_type="RubinU-NVL576", size=8, id="a"),
-        evaluator.Island(gpu_type="RubinU-NVL576", size=16, id="b"),
-        evaluator.Island(gpu_type="RubinU-NVL576", size=32, id="c"),
-        evaluator.Island(gpu_type="RubinU-NVL576", size=64, id="d"),
-        evaluator.Island(gpu_type="H800", size=8, id="e"),
-        evaluator.Island(gpu_type="H800", size=16, id="f"),
-        evaluator.Island(gpu_type="H800", size=32, id="g"),
-        evaluator.Island(gpu_type="H800", size=64, id="h"),
-        evaluator.Island(gpu_type="H20", size=8, id="i"),
-        evaluator.Island(gpu_type="H20", size=16, id="j"),
-        evaluator.Island(gpu_type="H20", size=32, id="k"),
-        evaluator.Island(gpu_type="H20", size=64, id="l"),
-    ]
-    islands = {island.id: island for island in islands}
-
-    # load the trace PDF
-    trace_pdf = evaluator.load_trace_pdf("traces/generated_trace_pdf.csv")
-
-    # Pack the prefill bins
-    model, prefill_throughput, decode_throughput, delta, objective = packer.solve_linear(islands, trace_pdf, resolution=100, print_debug=False)
-
-    # check if the model is not None
-    if model is not None:
-        print("\n=== Packer Results ===")
-        print(f"Prefill Throughput: {prefill_throughput:.4f} requests/s")
-        print(f"Decode Throughput: {decode_throughput:.4f} requests/s")
-        print(f"Deviation: {delta:.4f}")
-        print(f"Objective: {objective:.4f}")
-
+    def add_bins_to_islands(self, model, islands):
         # add assignments to the islands
         for (island_id, range_id), value in model['prefill']['assignment'].items():
             if value == 0:
@@ -555,18 +525,28 @@ if __name__ == "__main__":
                 )
             )
 
+        # return the updated islands
+        return islands
+
+    def save_model(self, model, islands, id):
+        # make folder for id
+        if not os.path.exists("./data/scratch"):
+            os.makedirs("./data/scratch")
+        if not os.path.exists(f"./data/scratch/{id}"):
+            os.makedirs(f"./data/scratch/{id}")
+
         # save model throughputs values to csv
-        with open("./data/scratch/model_prefill_throughput.csv", "w") as f:
+        with open(f"./data/scratch/{id}/model_prefill_throughput.csv", "w") as f:
             f.write("Sequence,Throughput\n")
             for range_id, throughput in model['prefill']['throughput'].items():
                 f.write(f"{model['ranges'][range_id]['sequence_length']},{throughput}\n")
-        with open("./data/scratch/model_decode_throughput.csv", "w") as f:
+        with open(f"./data/scratch/{id}/model_decode_throughput.csv", "w") as f:
             f.write("Sequence,Throughput\n")
             for range_id, throughput in model['decode']['throughput'].items():
                 f.write(f"{model['ranges'][range_id]['sequence_length']},{throughput}\n")
 
         # save the assignment to a csv
-        with open("./data/scratch/model_assignment.csv", "w") as f:
+        with open(f"./data/scratch/{id}/model_assignment.csv", "w") as f:
             line = (
                 "Island,"
                 "Range,"
@@ -603,9 +583,62 @@ if __name__ == "__main__":
                         f"{model['modes'][(island_id, range_id)]}\n"
                     )
                     f.write(line)
+
+# Example usage
+if __name__ == "__main__":
+    GPU_TYPES = ["DGX-B300", "H200"]
+    INVENTORY = {"DGX-B300": 128, "H200": 256}
+
+    # Create a packer instance
+    packer = Packer(GPU_TYPES)
+
+    # Define bins and slots
+    island_config = {
+        "DGX-B300": [18, 16, 17, 28, 7, 5, 10, 15],
+        "H200": [42, 8, 95, 14, 39, 58],
+    }
+
+    # create islands based on the configuration
+    islands = []
+    for gpu_type, sizes in island_config.items():
+        for idx, size in enumerate(sizes):
+            new_island = evaluator.Island(
+                id=f"{gpu_type}_{idx}",
+                gpu_type=gpu_type,
+                size=size,
+            )
+            islands.append(new_island)
+                
+    islands = {island.id: island for island in islands}
+
+    # load the trace PDF
+    trace_pdf = evaluator.load_trace_pdf("traces/code_context_tokens_hist.csv")
+
+    # Pack the prefill bins
+    model, prefill_throughput, decode_throughput, delta, objective = packer.solve_linear(islands, trace_pdf, resolution=100, print_debug=False)
+
+    if prefill_throughput is None or decode_throughput is None:
+        exit(1)
+    else:
+        overall_throughput = min(prefill_throughput, decode_throughput)
+
+    # check if the model is not None
+    if model is not None:
+        print("\n=== Packer Results ===")
+        print(f"Prefill Throughput: {prefill_throughput:.4f} requests/s")
+        print(f"Decode Throughput: {decode_throughput:.4f} requests/s")
+        print(f"Deviation: {delta:.4f}")
+        print(f"Objective: {objective:.4f}")
+
+        # save the model
+        packer.save_model(model, islands, "demo")
+
+        # add the bins to the islands
+        new_islands = packer.add_bins_to_islands(model, islands)
+
         # pass to evaluator
-        evaluator = evaluator.Evaluator(gpu_types)
-        prefill_throughput, decode_throughput = evaluator.evaluate(islands, trace_pdf, print_debug=False)
+        evaluator = evaluator.Evaluator(GPU_TYPES)
+        prefill_throughput, decode_throughput = evaluator.evaluate(new_islands, trace_pdf, "demo", print_debug=False)
 
         print("\n=== Evaluator Results ===")
         print(f"Prefill Throughput: {prefill_throughput:.4f} requests/s")

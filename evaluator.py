@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import random
 import string
@@ -37,7 +38,7 @@ class Evaluator:
         self.decode_len_avg = 100
         self.decode_len_max = 1000
 
-    def evaluate(self, islands, trace_pdf, print_debug=True):
+    def evaluate(self, islands, trace_pdf, id, print_debug=True):
         # store the throughput for each assignment
         results = {}
 
@@ -118,7 +119,7 @@ class Evaluator:
                             # don't continue if the time is infinite
                             if time_ms == np.inf:
                                 total_time_ms = np.inf
-                                print(f"Error: Infinite time for sequence length {sequence_length} and decode length {current_decode_length} on island {island_id}.")
+                                #print(f"Error: Infinite time for sequence length {sequence_length} and decode length {current_decode_length} on island {island_id}.")
                                 break
                             else:
                                 total_time_ms += time_ms
@@ -166,12 +167,18 @@ class Evaluator:
             results[sequence_length]["total_prefill_throughput"] = total_prefill_throughput
             results[sequence_length]["total_decode_throughput"] = total_decode_throughput
 
+        # make folder for id
+        if not os.path.exists("./data/scratch"):
+            os.makedirs("./data/scratch")
+        if not os.path.exists(f"./data/scratch/{id}"):
+            os.makedirs(f"./data/scratch/{id}")
+
         # save throughput values to a csv file
-        with open("./data/scratch/true_prefill_throughput.csv", "w") as f:
+        with open(f"./data/scratch/{id}/eval_prefill_throughput.csv", "w") as f:
             f.write("Sequence,Throughput\n")
             for sequence_length, result in results.items():
                 f.write(f"{sequence_length},{result['total_prefill_throughput']}\n")
-        with open("./data/scratch/true_decode_throughput.csv", "w") as f:
+        with open(f"./data/scratch/{id}/eval_decode_throughput.csv", "w") as f:
             f.write("Sequence,Throughput\n")
             for sequence_length, result in results.items():
                 f.write(f"{sequence_length},{result['total_decode_throughput']}\n")    

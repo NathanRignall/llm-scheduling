@@ -1,17 +1,14 @@
-from ax import Arm, Data, OrderConstraint, SumConstraint
+from ax import Arm, Data, SumConstraint
 from ax.core.experiment import Experiment
 from ax.core.search_space import SearchSpace
-from ax.core.parameter import ParameterType, ChoiceParameter, RangeParameter
-from ax.core.metric import Metric
+from ax.core.parameter import ParameterType, RangeParameter
 from ax.core.objective import Objective
 from ax.core.optimization_config import OptimizationConfig
 from ax.metrics.noisy_function import GenericNoisyFunctionMetric
 from ax.runners.synthetic import SyntheticRunner
 from ax.modelbridge.registry import Models
-from ax.modelbridge.cross_validation import cross_validate, compute_diagnostics
 from ax.service.utils.report_utils import exp_to_df
 from botorch.models.fully_bayesian import SaasFullyBayesianSingleTaskGP
-from ax.models.torch.botorch_modular.surrogate import Surrogate
 from ax.models.torch.botorch_modular.surrogate import SurrogateSpec, ModelConfig
 import numpy as np
 
@@ -24,12 +21,11 @@ K_SLOTS = 8
 GPU_TYPES = ["DGX-B300", "H200"]
 INVENTORY = {"DGX-B300": 128, "H200": 256}
 
-pack = packer.Packer(
-    gpu_types=GPU_TYPES,
-)
-
 parameters = []
 parameter_constraints = []
+
+# --- Create packer and evaluator instances ---
+sys_packer = packer.Packer(GPU_TYPES)
 
 # --- Define trace PDF ---
 trace_pdf = evaluator.load_trace_pdf("traces/generated_trace_pdf.csv")
@@ -103,7 +99,7 @@ def eval_config_outer(params):
     islands = {island.id: island for island in islands}
 
     # Evaluate configuration
-    _, prefill_throughput, decode_throughput, _, _ =  pack.solve_linear(islands, trace_pdf, resolution=100, print_debug=False)
+    _, prefill_throughput, decode_throughput, _, _ =  sys_packer.solve_linear(islands, trace_pdf, resolution=100, print_debug=False)
 
     # pick lowest throughput if neither is None
     if prefill_throughput is None or decode_throughput is None:
@@ -144,7 +140,7 @@ def generate_okay_configs(n_configs: int = 1):
     configs = []
     for _ in range(n_configs):
         cfg = {}
-        # For each GPU type, track how many we've allocated so we don't exceed INVENTORY[gpu_type]
+        # For each GPU type, track how many we've allocated so we don't exceed inventory
         for gpu_type in GPU_TYPES:
             total_used = 0
             for k in range(K_SLOTS):
@@ -160,7 +156,7 @@ def generate_okay_configs(n_configs: int = 1):
         configs.append(cfg)
     return configs
 
-# Generate, for example, 3 warm‐start configurations
+# Generate warm‐start configurations
 initial_parameters = generate_okay_configs(n_configs=5)
 
 def add_initial_arms(experiment, initial_parameters):
@@ -188,7 +184,7 @@ model_config = ModelConfig(
     mll_options={
         "num_samples": NUM_SAMPLES,
         "warmup_steps": WARMUP_STEPS,
-        },
+    },
 )
 
 surrogate_spec = SurrogateSpec(
