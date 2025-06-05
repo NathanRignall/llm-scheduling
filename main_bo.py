@@ -16,7 +16,7 @@ import packer
 import evaluator
 
 # --- Define search space ---
-K_SLOTS = 8
+K_SLOTS = 16
 
 GPU_TYPES = ["DGX-B300", "H200"]
 INVENTORY = {"DGX-B300": 128, "H200": 256}
@@ -225,3 +225,6 @@ df = exp_to_df(experiment).sort_values(by=["trial_index"])
 best = df.loc[df["rho_max"].idxmin()]
 print("Best parameters:")
 print(best.drop(["trial_index"]))
+
+# save intermediate results to CSV
+df.to_csv("data/scratch/gpu_island_scheduler_results.csv", index=False)

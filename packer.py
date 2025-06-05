@@ -234,11 +234,11 @@ class Packer:
             'modes': modes,
         }
 
-        if print_debug:
-            # print the binary variables (to see if prefill or decode is selected)
-            print("\n=== Binary Variables ===")
-            for island_id in island_ids:
-                print(f"  Island {island_id}: {"Decode" if z[island_id].varValue == 1 else "Prefill"}")
+        # if print_debug:
+        #     # print the binary variables (to see if prefill or decode is selected)
+        #     print("\n=== Binary Variables ===")
+        #     for island_id in island_ids:
+        #         print(f"  Island {island_id}: {"Decode" if z[island_id].varValue == 1 else "Prefill"}")
 
         # print the overall stats
         print("\n=== Overall Stats ===")
