@@ -1,5 +1,6 @@
 import numpy as np
 import os
+import pandas as pd
 
 from ax import Arm, Data, Experiment
 from ax.core.search_space import SearchSpace
@@ -187,6 +188,12 @@ def add_initial_arms_to_experiment(exp_obj, initial_params_list):
 
 # --- Main function ---
 def main(batch_size: int = 5, n_iterations: int = 20, path: str = "./data/scratch/gpu_island_scheduler_results.csv"):
+    # new df for storing timestamps
+    time_df = pd.DataFrame(columns=['trial index', 'timestamp'])
+
+    # add first timestamp
+    time_df.loc[len(time_df)] = [0, pd.Timestamp.now()]
+
     # Create search space and experiment
     search_space = create_search_space(GPU_TYPES, INVENTORY, MIN_ISLAND_SIZE_GLOBAL)
     experiment = create_experiment(search_space)
@@ -215,8 +222,8 @@ def main(batch_size: int = 5, n_iterations: int = 20, path: str = "./data/scratc
         mll_options={}
     )
 
-    print(f"\n--- Starting Standard GP Optimization "
-          f"({n_iterations} iterations, {batch_size} batch size) ---")
+    print(f"\n--- Starting Standard GP Optimization ({n_iterations} iterations, {batch_size} batch size) ---")
+
     for i in range(n_iterations):
         print(f"\n--- Iteration {i + 1}/{n_iterations} ---")
         model = Models.BOTORCH_MODULAR(
@@ -244,6 +251,9 @@ def main(batch_size: int = 5, n_iterations: int = 20, path: str = "./data/scratc
         best = data.df.loc[data.df["mean"].idxmin()]
         print(f"Best rho_max: {best['mean']} for arm {best['arm_name']}")
 
+        # Add timestamp for this trial
+        time_df.loc[len(time_df)] = [trial.index, pd.Timestamp.now()]
+
     # --- Final results ---
     df = exp_to_df(experiment).sort_values(by=["trial_index"])
     best = df.loc[df["rho_max"].idxmin()]
@@ -252,21 +262,17 @@ def main(batch_size: int = 5, n_iterations: int = 20, path: str = "./data/scratc
 
     # Save intermediate results to CSV
     df.to_csv(path, index=False)
+    time_df.to_csv(path.replace(".csv", "_timestamps.csv"), index=False)
 
-# simple test (batch size 5, 20 iterations, 10 trials)
-# if __name__ == "__main__":
-#     # make folder if it doesn't exist
-#     os.makedirs(os.path.dirname("./data/scratch/5_20_10/"), exist_ok=True)
-
-#     for i in range(10):
-#         print(f"\n\n--- Running main iteration {i + 1} ---")
-#         main(batch_size=5, n_iterations=20, path=f"./data/scratch/5_20_10/gpu_island_scheduler_results_{i + 1}.csv")
-
-# simple test (batch size 10, 20 iterations, 10 trials)
-# if __name__ == "__main__":
-#     # make folder if it doesn't exist
-#     os.makedirs(os.path.dirname("./data/scratch/10_20_10/"), exist_ok=True)
-
-#     for i in range(10):
-#         print(f"\n\n--- Running main iteration {i + 1} ---")
-#         main(batch_size=10, n_iterations=20, path=f"./data/scratch/10_20_10/gpu_island_scheduler_results_{i + 1}.csv")
+if __name__ == "__main__":
+    batch_sizes = [1, 2, 4, 8, 16]
+    for batch in batch_sizes:
+        dir_path = f"./data/scratch/{batch}_20_10"
+        os.makedirs(dir_path, exist_ok=True)
+        for i in range(10):
+            print(f"\n\n--- Running batch size {batch}, trial {i + 1}/10 ---")
+            main(
+                batch_size=batch,
+                n_iterations=20,
+                path=f"{dir_path}/trial_{i + 1}.csv",
+            )
