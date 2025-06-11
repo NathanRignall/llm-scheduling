@@ -19,16 +19,23 @@ import evaluator
 import divider
 
 # --- Define constants ---
-GPU_TYPES = ["DGX-B300", "H200"]
-INVENTORY = {"DGX-B300": 128, "H200": 256}
-MIN_ISLAND_SIZE_GLOBAL = 2
+GPU_TYPES = ["DGX-B300", "GB300-NVL72", "H200", "H800", "H20"]
 
 # --- Initialization ---
 sys_pack = packer.Packer(gpu_types=GPU_TYPES)
+
+# converation AzureLLM
 trace_pdf = evaluator.load_trace_pdf("traces/conv_context_tokens_hist.csv")
+decode_len_avg = 106
+decode_len_max = 1500
+
+# code AzureLLM
+trace_pdf = evaluator.load_trace_pdf("traces/code_context_tokens_hist.csv")
+decode_len_avg = 22
+decode_len_max = 5000
 
 # --- Define the search space ---
-def create_search_space(gpu_types: list[str], inventory: dict[str, int], min_island_size: int) -> SearchSpace:
+def create_search_space(gpu_types: list[str], inventory: dict[str, int], min_island_size: int, skew_exponent_range=(-5.0, 5.0)) -> SearchSpace:
     parameters: list[RangeParameter] = []
 
     for gpu_type in gpu_types:
@@ -53,19 +60,16 @@ def create_search_space(gpu_types: list[str], inventory: dict[str, int], min_isl
             RangeParameter(
                 name=f"skew_exponent_{gpu_type}",
                 parameter_type=ParameterType.FLOAT,
-                lower=-5.0,
-                upper=5.0,
+                lower=skew_exponent_range[0],
+                upper=skew_exponent_range[1],
             )
         )
-
-    if not parameters:
-        raise ValueError("No parameters defined for BO. Check inventory and min_island_size.")
 
     return SearchSpace(parameters=parameters)
 
 # --- Inner-loop evaluator ---
-def eval_config_outer(params_dict):
-    print(f"\n\n***** Evaluating configuration with params: {params_dict} *****")
+def eval_config_outer(params_dict, inventory, min_island_size):
+    print(f"\n\n***** Evaluating configuration with params: {params_dict}, min_island_size={min_island_size} *****")
     all_generated_islands = []
 
     for gpu_type in GPU_TYPES:
@@ -73,19 +77,19 @@ def eval_config_outer(params_dict):
         skew_exponent_param_name = f"skew_exponent_{gpu_type}"
 
         if num_islands_param_name not in params_dict or skew_exponent_param_name not in params_dict:
-            if INVENTORY.get(gpu_type, 0) > 0:
+            if inventory.get(gpu_type, 0) > 0:
                  print(f"Warning: Parameters for {gpu_type} not in params_dict. Skipping island generation for it.")
             continue
 
         num_islands_param = params_dict[num_islands_param_name]
         skew_exponent_param = params_dict[skew_exponent_param_name]
-        current_inventory_for_type = INVENTORY[gpu_type]
+        current_inventory_for_type = inventory[gpu_type]
 
         island_sizes_for_type = divider.island_divider(
             total_gpus_for_type=current_inventory_for_type,
             num_islands_target=num_islands_param,
             size_distribution_skew_exponent=skew_exponent_param,
-            min_island_size=MIN_ISLAND_SIZE_GLOBAL
+            min_island_size=min_island_size,
         )
         print(f"  Generated island sizes for {gpu_type}: {island_sizes_for_type} (Sum: {sum(island_sizes_for_type)})")
 
@@ -103,7 +107,7 @@ def eval_config_outer(params_dict):
     
     # print(f"Calling packer.solve_linear with {len(islands_dict)} islands...")
     model_solution, prefill_throughput, decode_throughput, delta, objective_val = sys_pack.solve_linear(
-        islands_dict, trace_pdf, resolution=100, print_debug=False # Set print_debug as needed
+        islands_dict, trace_pdf, decode_len_avg, decode_len_max, resolution=100, print_debug=False # Set print_debug as needed
     )
 
     if prefill_throughput is None or decode_throughput is None or prefill_throughput <= 1e-6 or decode_throughput <= 1e-6:
@@ -116,14 +120,14 @@ def eval_config_outer(params_dict):
     return rho_max
 
 # --- Create the experiment ---
-def create_experiment(search_space) -> Experiment:
+def create_experiment(search_space, inventory, min_island_size) -> Experiment:
     # --- Optimization config ---
     optimization_config = OptimizationConfig(
         objective=Objective(
             metric=GenericNoisyFunctionMetric(
                 name="rho_max",
-                f=eval_config_outer,        # Use the existing eval function
-                noise_sd=1e-4,              # Assuming near‐deterministic
+                f=lambda param_dict: eval_config_outer(param_dict, inventory, min_island_size),
+                noise_sd=1e-4,
                 lower_is_better=True,
             ),
             minimize=True,
@@ -135,7 +139,7 @@ def create_experiment(search_space) -> Experiment:
         name="gpu_island_scheduler_v2_divider",
         search_space=search_space,
         optimization_config=optimization_config,
-        runner=SyntheticRunner(),  # Will call eval_config_outer directly
+        runner=SyntheticRunner(),
     )
     return experiment
 
@@ -187,7 +191,7 @@ def add_initial_arms_to_experiment(exp_obj, initial_params_list):
         trial.run() # This will call eval_config_outer
 
 # --- Main function ---
-def main(batch_size: int = 5, n_iterations: int = 20, path: str = "./data/scratch/gpu_island_scheduler_results.csv"):
+def main(inventory: dict[str, int], batch_size: int = 5, n_iterations: int = 20, min_island_size: int = 2, path: str = "./data/scratch/gpu_island_scheduler_results.csv"):
     # new df for storing timestamps
     time_df = pd.DataFrame(columns=['trial index', 'timestamp'])
 
@@ -195,23 +199,23 @@ def main(batch_size: int = 5, n_iterations: int = 20, path: str = "./data/scratc
     time_df.loc[len(time_df)] = [0, pd.Timestamp.now()]
 
     # Create search space and experiment
-    search_space = create_search_space(GPU_TYPES, INVENTORY, MIN_ISLAND_SIZE_GLOBAL)
-    experiment = create_experiment(search_space)
+    search_space = create_search_space(GPU_TYPES, inventory, min_island_size)
+    experiment = create_experiment(search_space, inventory, min_island_size)
 
     # Generate initial configurations
     initial_parameters_list = generate_okay_configs(
         n_configs=5, search_space_obj=experiment.search_space
     )
 
+    # Add initial arms to the experiment
     if initial_parameters_list:
         add_initial_arms_to_experiment(experiment, initial_parameters_list)
-        # Fetch data from the initial trials. This is important for the model.
         data = experiment.fetch_data()
         print("\n--- Initial Warm-Start Data ---")
         print(data.df)
     else:
         print("No initial parameters generated. Starting BO without warm-start.")
-        data = Data()  # Start with empty data if no initial trials
+        data = Data()
 
     # --- BO loop ---
 
@@ -241,13 +245,14 @@ def main(batch_size: int = 5, n_iterations: int = 20, path: str = "./data/scratc
         new_data = trial.fetch_data()
         for _, row in new_data.df.iterrows():
             print(f"Iteration {i+1}, arm {row['arm_name']}: rho_max = {row['mean']}")
-
         data = Data.from_multiple_data([data, new_data])
 
+        # Print intermediate results
         print("\nIntermediate results:")
         print(data.df[["arm_name", "mean"]].sort_values(by="mean"))
         print("\n")
 
+        # Print best roh
         best = data.df.loc[data.df["mean"].idxmin()]
         print(f"Best rho_max: {best['mean']} for arm {best['arm_name']}")
 
@@ -264,15 +269,101 @@ def main(batch_size: int = 5, n_iterations: int = 20, path: str = "./data/scratc
     df.to_csv(path, index=False)
     time_df.to_csv(path.replace(".csv", "_timestamps.csv"), index=False)
 
+# uncomment to execute experiment
 if __name__ == "__main__":
-    batch_sizes = [1, 2, 4, 8, 16]
-    for batch in batch_sizes:
-        dir_path = f"./data/scratch/{batch}_20_10"
-        os.makedirs(dir_path, exist_ok=True)
-        for i in range(10):
-            print(f"\n\n--- Running batch size {batch}, trial {i + 1}/10 ---")
-            main(
-                batch_size=batch,
-                n_iterations=20,
-                path=f"{dir_path}/trial_{i + 1}.csv",
-            )
+    # #test various batch sizes
+    # batch_sizes = [2,4,8,16]
+    # for batch in batch_sizes:
+    #     dir_path = f"./data/scratch/{batch}_20_10"
+    #     os.makedirs(dir_path, exist_ok=True)
+    #     for i in range(10):
+    #         print(f"\n\n--- Running batch size {batch}, trial {i + 1}/10 ---")
+    #         main(
+    #             batch_size=batch,
+    #             n_iterations=20,
+    #             path=f"{dir_path}/trial_{i + 1}.csv",
+    #         )
+
+    # # test various skew exponent ranges
+    # skew_ranges = [(-5.0, 5.0), (-3.0, 3.0), (-1.0, 1.0)]
+    # for skew_range in skew_ranges:
+    #     dir_path = f"./data/scratch/skew_{skew_range[0]}_{skew_range[1]}"
+    #     os.makedirs(dir_path, exist_ok=True)
+    #     for i in range(10):
+    #         print(f"\n\n--- Running skew range {skew_range}, trial {i + 1}/10 ---")
+    #         main(
+    #             batch_size=8,
+    #             n_iterations=20,
+    #             path=f"{dir_path}/trial_{i + 1}.csv",
+    #         )
+
+    # # test various min island sizes
+    # min_island_sizes = [8, 4, 2]
+    # for min_island_size in min_island_sizes:
+    #     dir_path = f"./data/scratch/min_island_size_{min_island_size}"
+    #     os.makedirs(dir_path, exist_ok=True)
+    #     for i in range(10):
+    #         print(f"\n\n--- Running min island size {min_island_size}, trial {i + 1}/10 ---")
+    #         main(
+    #             batch_size=8,
+    #             n_iterations=20,
+    #             min_island_size=min_island_size,
+    #             path=f"{dir_path}/trial_{i + 1}.csv",
+    #         )
+
+    # test inventory configurations
+    # inventory_configs = [
+    #     {"DGX-B300": 128, "H200": 256},
+    #     {"GB300-NVL72": 64, "H800": 128},
+    #     {"H20": 128, "H200": 128},
+    #     {"DGX-B300": 64, "GB300-NVL72": 32, "H800": 16},
+    #     {"DGX-B300": 64, "GB300-NVL72": 64, "H200": 256, "H800": 128, "H20": 256},
+    # ]
+
+    # # azure conversation 
+    # for inventory in inventory_configs:
+    #     dir_path = f"./data/scratch/azure_conv_{'_'.join(f'{k}-{v}' for k, v in inventory.items())}"
+    #     os.makedirs(dir_path, exist_ok=True)
+    #     for i in range(10):
+    #         print(f"\n\n--- Running inventory {inventory}, trial {i + 1}/10 ---")
+    #         main(
+    #             inventory=inventory,
+    #             batch_size=8,
+    #             n_iterations=15,
+    #             path=f"{dir_path}/trial_{i + 1}.csv",
+    #         )
+
+    # inventory_configs = [
+    #     {"H200": 64, "H800": 64, "H20": 128},
+    #     {"H200": 32, "H800": 128, "H20": 128},
+    #     {"H200": 128},
+    #     {"H800": 256}
+    # ]
+
+    # # azure conversation 
+    # for inventory in inventory_configs:
+    #     dir_path = f"./data/scratch/het_azure_conv_{'_'.join(f'{k}-{v}' for k, v in inventory.items())}"
+    #     os.makedirs(dir_path, exist_ok=True)
+    #     for i in range(5):
+    #         print(f"\n\n--- Running inventory {inventory}, trial {i + 1}/10 ---")
+    #         main(
+    #             inventory=inventory,
+    #             batch_size=16,
+    #             n_iterations=15,
+    #             path=f"{dir_path}/trial_{i + 1}.csv",
+    #         )
+
+    # # azure code 
+    # for inventory in inventory_configs:
+    #     dir_path = f"./data/scratch/het_azure_code_{'_'.join(f'{k}-{v}' for k, v in inventory.items())}"
+    #     os.makedirs(dir_path, exist_ok=True)
+    #     for i in range(5):
+    #         print(f"\n\n--- Running inventory {inventory}, trial {i + 1}/10 ---")
+    #         main(
+    #             inventory=inventory,
+    #             batch_size=16,
+    #             n_iterations=15,
+    #             path=f"{dir_path}/trial_{i + 1}.csv",
+    #         )
+
+    print("All experiments completed.")

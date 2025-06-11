@@ -14,15 +14,13 @@ class Packer:
         self.args = simulator.ModelArgs()
         self.prefill_gpu_list = simulator.get_gpu_info(gpu_info_file, decoding_mode=False, device_list=gpu_types, discount_rate=0.85)
         self.decode_gpu_list = simulator.get_gpu_info(gpu_info_file, decoding_mode=True, device_list=gpu_types, discount_rate=0.85)
-        self.decode_len_avg = 100
-        self.decode_len_max = 1000
 
         # cache variables
         self.ranges_cache = {}
         self.prefill_config_cache = {}
         self.decode_config_cache = {}
 
-    def solve_linear(self, islands, trace_pdf, resolution=10, print_debug=True):
+    def solve_linear(self, islands, trace_pdf, decode_len_avg, decode_len_max, resolution=10, print_debug=True):
         print("\n=== Packer ===")
 
         # form ranges from the trace PDF
@@ -35,7 +33,7 @@ class Packer:
 
         # # for each island, find the best gpu configuration during decode
         print("*** Decode GPU Config ***")
-        decode_configs = self.get_decode_config(islands, ranges)
+        decode_configs = self.get_decode_config(islands, ranges, decode_len_avg, decode_len_max)
 
         # print the results
         if print_debug:
@@ -373,7 +371,7 @@ class Packer:
 
         return prefill_configs
 
-    def get_decode_config(self, islands, ranges):
+    def get_decode_config(self, islands, ranges, decode_len_avg, decode_len_max):
         # for each island, find the best gpu configuration during decode
         decode_configs = {}
         for index, (island_id, island) in enumerate(islands.items()):
@@ -405,7 +403,7 @@ class Packer:
                             self.decode_gpu_list[island.gpu_type],
                             tp_num=tp,
                             seq_len=range['max'],
-                            decode_len=self.decode_len_max,
+                            decode_len=decode_len_max,
                             gemm_group_per_device=math.ceil(self.args.n_routed_experts / loop_num_gpus),
                             device_num=loop_num_gpus,
                         )
@@ -416,14 +414,14 @@ class Packer:
                         batch_size = max(batch_size, 8)
 
                         total_time_ms = 0
-                        for current_decode_length in builtins.range(1, self.decode_len_avg, 1):
+                        for current_decode_length in builtins.range(1, decode_len_avg, 1):
                             time_ms, _ = simulator.decode_time(
                                 self.args,
                                 self.decode_gpu_list[island.gpu_type],
                                 tp_num=tp,
                                 bs_num=batch_size,
                                 seq_len=range['sequence_length'] + current_decode_length,
-                                decode_len=self.decode_len_avg - current_decode_length,
+                                decode_len=decode_len_avg - current_decode_length,
                                 gemm_group_per_device=math.ceil(self.args.n_routed_experts / loop_num_gpus),
                                 device_num=loop_num_gpus,
                             )
@@ -612,10 +610,12 @@ if __name__ == "__main__":
     islands = {island.id: island for island in islands}
 
     # load the trace PDF
-    trace_pdf = evaluator.load_trace_pdf("traces/code_context_tokens_hist.csv")
+    trace_pdf = evaluator.load_trace_pdf("traces/generated_trace_pdf.csv")
+    decode_avg = 100
+    decode_max = 1000
 
     # Pack the prefill bins
-    model, prefill_throughput, decode_throughput, delta, objective = packer.solve_linear(islands, trace_pdf, resolution=100, print_debug=False)
+    model, prefill_throughput, decode_throughput, delta, objective = packer.solve_linear(islands, trace_pdf, decode_avg, decode_max, resolution=100, print_debug=False)
 
     if prefill_throughput is None or decode_throughput is None:
         exit(1)
