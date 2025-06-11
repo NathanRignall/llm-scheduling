@@ -1,3 +1,7 @@
+# Scheduling of Distributed LLM Serving on Heterogeneous GPUs
+# Nathan Rignall
+# Evaluator - Takes sample configuration, evaluates using the simulator, and returns throughput values.
+
 import os
 import pandas as pd
 import random
@@ -38,7 +42,7 @@ class Evaluator:
         self.decode_len_avg = 100
         self.decode_len_max = 1000
 
-    def evaluate(self, islands, trace_pdf, id, print_debug=True):
+    def evaluate(self, islands, trace_pdf, id, print_debug=True, path="{path}/"):
         # store the throughput for each assignment
         results = {}
 
@@ -168,17 +172,17 @@ class Evaluator:
             results[sequence_length]["total_decode_throughput"] = total_decode_throughput
 
         # make folder for id
-        if not os.path.exists("./data/scratch"):
-            os.makedirs("./data/scratch")
-        if not os.path.exists(f"./data/scratch/{id}"):
-            os.makedirs(f"./data/scratch/{id}")
+        if not os.path.exists(path):
+            os.makedirs(path)
+        if not os.path.exists(f"{path}/{id}"):
+            os.makedirs(f"{path}/{id}")
 
         # save throughput values to a csv file
-        with open(f"./data/scratch/{id}/eval_prefill_throughput.csv", "w") as f:
+        with open(f"{path}/{id}/eval_prefill_throughput.csv", "w") as f:
             f.write("Sequence,Throughput\n")
             for sequence_length, result in results.items():
                 f.write(f"{sequence_length},{result['total_prefill_throughput']}\n")
-        with open(f"./data/scratch/{id}/eval_decode_throughput.csv", "w") as f:
+        with open(f"{path}/{id}/eval_decode_throughput.csv", "w") as f:
             f.write("Sequence,Throughput\n")
             for sequence_length, result in results.items():
                 f.write(f"{sequence_length},{result['total_decode_throughput']}\n")    

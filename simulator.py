@@ -1,7 +1,9 @@
+# Shallowsim Simulator
+# based of https://github.com/icezack12/shallowsim with some modifications
+
 import pandas as pd
 import math
 import numpy as np
-from functools import reduce
 
 NVL_GPU_LIST = [72, 144, 576]
 

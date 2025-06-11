@@ -1,3 +1,7 @@
+# Scheduling of Distributed LLM Serving on Heterogeneous GPUs
+# Nathan Rignall
+# Packer - Used to pack the prefill and decode bins into the islands (inner loop)
+
 import math
 import os
 import numpy as np

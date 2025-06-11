@@ -1,13 +1,12 @@
+# Scheduling of Distributed LLM Serving on Heterogeneous GPUs
+# Nathan Rignall
+# Divider - Takes a total number of GPUs for a specific type and divides them into islands
+
 import math
 
-def island_divider( # Renamed for clarity of this version
-    total_gpus_for_type: int,
-    num_islands_target: int,
-    size_distribution_skew_exponent: float,
-    min_island_size: int = 1
-) -> list[int]:
-    # Docstring remains the same as island_divider_v2...
-
+# divide the total number of GPUs for a specific type into islands
+def island_divider(total_gpus_for_type: int, num_islands_target: int, size_distribution_skew_exponent: float, min_island_size: int = 1) -> list[int]:
+    # check constraints
     if min_island_size <= 0:
         raise ValueError("Minimum island size must be positive.")
     if total_gpus_for_type < 0:
@@ -32,6 +31,7 @@ def island_divider( # Renamed for clarity of this version
     if actual_num_islands == 0:
         return []
 
+    # compute the base allocation per island
     base_allocation_per_island = min_island_size
     gpus_used_for_base = actual_num_islands * base_allocation_per_island
     remaining_gpus_to_distribute = gpus_to_allocate - gpus_used_for_base
@@ -45,6 +45,7 @@ def island_divider( # Renamed for clarity of this version
         final_island_sizes[0] += remaining_gpus_to_distribute
         return final_island_sizes
 
+    # distribute the remaining GPUs according to the skew exponent
     weights = []
     for i in range(actual_num_islands):
         base_val = float(i + 1) 
@@ -67,6 +68,7 @@ def island_divider( # Renamed for clarity of this version
     for i in range(actual_num_islands):
         final_island_sizes[i] += additional_allocations_int[i]
 
+    # if there is a discrepancy, distribute it based on the fractional parts
     if discrepancy_to_distribute > 0: 
         fractional_parts = []
         for i in range(actual_num_islands):

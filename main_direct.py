@@ -1,3 +1,7 @@
+# Scheduling of Distributed LLM Serving on Heterogeneous GPUs
+# Nathan Rignall
+# Main Direct - Used to generate islands and evaluate configurations using Bayesian Optimization (outer loop)
+
 import numpy as np
 import os
 import pandas as pd
@@ -27,15 +31,15 @@ INVENTORY = {"DGX-B300": 128, "H200": 256}
 # --- Create packer and evaluator instances ---
 sys_packer = packer.Packer(GPU_TYPES)
 
-# converation AzureLLM
+# conversation AzureLLM
 trace_pdf = evaluator.load_trace_pdf("traces/conv_context_tokens_hist.csv")
 decode_len_avg = 106
 decode_len_max = 1500
 
-# code AzureLLM
-trace_pdf = evaluator.load_trace_pdf("traces/code_context_tokens_hist.csv")
-decode_len_avg = 22
-decode_len_max = 5000
+# # code AzureLLM
+# trace_pdf = evaluator.load_trace_pdf("traces/code_context_tokens_hist.csv")
+# decode_len_avg = 22
+# decode_len_max = 5000
 
 # --- Define the search space ---
 def create_search_space(gpu_types: list[str], inventory: dict[str, int], k_slots: int) -> SearchSpace:
@@ -43,10 +47,9 @@ def create_search_space(gpu_types: list[str], inventory: dict[str, int], k_slots
     parameter_constraints = []
 
     for gpu_type in gpu_types:
-        # GPU Sum
         gpu_sum = []
 
-        # For each GPU type, create k slots of parameters
+        # create k slots of parameters
         for k in range(k_slots):
             # GPU Count
             gpu_count = RangeParameter(
@@ -54,13 +57,11 @@ def create_search_space(gpu_types: list[str], inventory: dict[str, int], k_slots
                 lower=0, upper=inventory[gpu_type],
             )
             
-            # Add parameters to search space
+            # add parameters to search space and add to sum
             parameters.append(gpu_count)
-
-            # Add to sum
             gpu_sum.append(gpu_count)
 
-        # Constrain GPU count per type to inventory
+        # constrain GPU count per type to inventory
         parameter_constraints += [
             SumConstraint(
                 parameters=gpu_sum,
@@ -76,7 +77,7 @@ def eval_config_outer(params, k_slots):
 
     print("\n\n***** Evaluating configuration *****")
 
-    # Inventory constraint: count GPUs used per type
+    # check the parameters
     for gpu_type in GPU_TYPES:
         total_count = 0
         for k in range(k_slots):
@@ -87,10 +88,10 @@ def eval_config_outer(params, k_slots):
             print(f"ERROR - Configuration rejected: {gpu_type} used {total_count} > {INVENTORY[gpu_type]} available")
             return 10.0
 
+    # create islands based on the parameters
     islands = []
     for gpu_type in GPU_TYPES:
         for k in range(k_slots):
-            # Extract island parameters
             count = params[f"count_{gpu_type}_{k}"]
 
             # Skip unused slots
@@ -102,14 +103,12 @@ def eval_config_outer(params, k_slots):
                 gpu_type=gpu_type,
                 size=count,
             )
-
-            # Add island to the list
             islands.append(island)
 
     # turn into dict
     islands = {island.id: island for island in islands}
 
-    # Evaluate configuration
+    # evaluate the islands
     _, prefill_throughput, decode_throughput, _, _ =  sys_packer.solve_linear(islands, trace_pdf, decode_len_avg, decode_len_max, resolution=100, print_debug=False)
 
     # pick lowest throughput if neither is None
@@ -127,7 +126,6 @@ def eval_config_outer(params, k_slots):
 
 # --- Create the experiment ---
 def create_experiment(search_space, k_slots) -> Experiment:
-    # --- Optimization config ---
     optimization_config = OptimizationConfig(
         objective=Objective(
             metric=GenericNoisyFunctionMetric(
@@ -140,9 +138,8 @@ def create_experiment(search_space, k_slots) -> Experiment:
         )
     )
 
-    # --- Build experiment ---
     experiment = Experiment(
-        name="gpu_island_scheduler",
+        name="gpu_island_scheduler_direct",
         search_space=search_space,
         optimization_config=optimization_config,
         runner=SyntheticRunner(),
@@ -154,11 +151,10 @@ def generate_okay_configs(n_configs: int, k_slots: int) -> list[dict]:
     configs = []
     for _ in range(n_configs):
         cfg = {}
-        # For each GPU type, track how many we've allocated so we don't exceed inventory
+        # for each GPU type, randomly allocate GPUs across k slots
         for gpu_type in GPU_TYPES:
             total_used = 0
             for k in range(k_slots):
-                # Remaining budget for this gpu_type
                 remaining = INVENTORY[gpu_type] - total_used
 
                 count = np.random.randint(0, remaining + 1)
@@ -178,24 +174,24 @@ def add_initial_arms(experiment, initial_parameters):
         trial.run()
 
 # --- Main function ---
-def main(batch_size: int = 5, n_iterations: int = 20, path: str = "./data/scratch/gpu_island_scheduler_results.csv", k_slots: int = 16):
+def main(batch_size: int = 5, n_iterations: int = 20, path: str = "./data/scratch/gpu_island_scheduler_results.csv", k_slots: int = 16, saasbo: bool = False):
     # new df for storing timestamps
     time_df = pd.DataFrame(columns=['trial index', 'timestamp'])
 
     # add first timestamp
     time_df.loc[len(time_df)] = [0, pd.Timestamp.now()]
 
-    # Create search space and experiment
+    # create search space and experiment
     search_space = create_search_space(GPU_TYPES, INVENTORY, k_slots)
     experiment = create_experiment(search_space, k_slots)
 
-    # Generate initial configurations
+    # generate initial configurations
     initial_parameters_list = generate_okay_configs(
         n_configs=5,
         k_slots=k_slots
     )
 
-    # Add initial arms to the experiment
+    # add initial arms to the experiment
     if initial_parameters_list:
         add_initial_arms(experiment, initial_parameters_list)
         data = experiment.fetch_data()
@@ -205,31 +201,30 @@ def main(batch_size: int = 5, n_iterations: int = 20, path: str = "./data/scratc
         print("No initial parameters generated. Starting BO without warm-start.")
         data = Data()
 
-    # # --- SAASBO loop ---
-    # NUM_SAMPLES = 128
-    # WARMUP_STEPS = 256
+    if saasbo:
+        # --- SAASBO loop ---
+        NUM_SAMPLES = 128
+        WARMUP_STEPS = 256
 
-    # model_config = ModelConfig(
-    #     botorch_model_class=SaasFullyBayesianSingleTaskGP,
-    #     model_options={},  
-    #     mll_options={
-    #         "num_samples": NUM_SAMPLES,
-    #         "warmup_steps": WARMUP_STEPS,
-    #     },
-    # )
+        model_config = ModelConfig(
+            botorch_model_class=SaasFullyBayesianSingleTaskGP,
+            model_options={},  
+            mll_options={
+                "num_samples": NUM_SAMPLES,
+                "warmup_steps": WARMUP_STEPS,
+            },
+        )
 
-    # surrogate = SurrogateSpec(
-    #     model_configs=[model_config],
-    # )
-
-    # --- BO loop ---
-
-    # Configure the Standard GP model
-    surrogate = Surrogate(
-        botorch_model_class=SingleTaskGP,
-        model_options={},
-        mll_options={}
-    )
+        surrogate = SurrogateSpec(
+            model_configs=[model_config],
+        )
+    else:
+        # --- BO loop ---
+        surrogate = Surrogate(
+            botorch_model_class=SingleTaskGP,
+            model_options={},
+            mll_options={},
+        )
 
     print(f"\n--- Starting Optimization ({n_iterations} iterations, {batch_size} batch size) ---")
 
@@ -241,27 +236,27 @@ def main(batch_size: int = 5, n_iterations: int = 20, path: str = "./data/scratc
             surrogate=surrogate,
         )
 
-        # Generate next candidates with SAASBO
+        # generate new arms
         generator_run = model.gen(n=batch_size)
         trial = experiment.new_batch_trial(generator_run=generator_run)
         trial.run()
 
-        # Update data
+        # fetch new data
         new_data = trial.fetch_data()
         for _, row in new_data.df.iterrows():
             print(f"Iteration {i+1}, arm {row['arm_name']}: rho_max = {row['mean']}")
         data = Data.from_multiple_data([data, new_data])
 
-        # Print intermediate results
+        # print intermediate results
         print("\nIntermediate results:")
         print(data.df[["arm_name", "mean"]].sort_values(by="mean"))
         print("\n")
 
-        # Print best roh
+        # print best arm so far
         best = data.df.loc[data.df["mean"].idxmin()]
         print(f"Best rho_max: {best['mean']} for arm {best['arm_name']}")
 
-        # Add timestamp for this trial
+        # add timestamp for this trial
         time_df.loc[len(time_df)] = [trial.index, pd.Timestamp.now()]
 
     # --- Final results ---
@@ -274,34 +269,66 @@ def main(batch_size: int = 5, n_iterations: int = 20, path: str = "./data/scratc
     df.to_csv(path, index=False)
     time_df.to_csv(path.replace(".csv", "_timestamps.csv"), index=False)
 
-# uncomment to execute experiment
+# main experiments
 if __name__ == "__main__":
-    # # Test various batch sizes
-    # batch_sizes = [2,4,8,16]
-    # for batch in batch_sizes:
-    #     dir_path = f"./data/scratch/xxxbo_{batch}_10_5"
-    #     os.makedirs(dir_path, exist_ok=True)
-    #     for i in range(5):
-    #         print(f"\n\n--- Running batch size {batch}, trial {i + 1}/5 ---")
-    #         main(
-    #             batch_size=batch,
-    #             n_iterations=10,
-    #             path=f"{dir_path}/trial_{i + 1}.csv",
-    #             k_slots=16,
-    #         )
+    # test various batch sizes (SAASBO)
+    batch_sizes = [2,4,8,16]
+    for batch in batch_sizes:
+        dir_path = f"./data/scratch/saasbo_{batch}_10_5"
+        os.makedirs(dir_path, exist_ok=True)
+        for i in range(5):
+            print(f"\n\n--- Running batch size {batch}, trial {i + 1}/5 ---")
+            main(
+                batch_size=batch,
+                n_iterations=10,
+                path=f"{dir_path}/trial_{i + 1}.csv",
+                k_slots=16,
+                saasbo=True,
+            )
 
-    # # test various k_slots
-    # k_slots_list = [16]
-    # for k_slots in k_slots_list:
-    #     dir_path = f"./data/scratch/saasbo_k_slots_{k_slots}"
-    #     os.makedirs(dir_path, exist_ok=True)
-    #     for i in range(4,5):
-    #         print(f"\n\n--- Running k_slots {k_slots}, trial {i + 1}/5 ---")
-    #         main(
-    #             batch_size=4,
-    #             n_iterations=10,
-    #             path=f"{dir_path}/trial_{i + 1}.csv",
-    #             k_slots=k_slots,
-    #         )
+    # test various batch sizes (BO)
+    batch_sizes = [2,4,8,16]
+    for batch in batch_sizes:
+        dir_path = f"./data/scratch/bo_{batch}_10_5"
+        os.makedirs(dir_path, exist_ok=True)
+        for i in range(5):
+            print(f"\n\n--- Running batch size {batch}, trial {i + 1}/5 ---")
+            main(
+                batch_size=batch,
+                n_iterations=10,
+                path=f"{dir_path}/trial_{i + 1}.csv",
+                k_slots=16,
+                saasbo=False,
+            )
+
+    # test various k_slots (SAASBO)
+    k_slots_list = [8,16,32]
+    for k_slots in k_slots_list:
+        dir_path = f"./data/scratch/saasbo_k_slots_{k_slots}"
+        os.makedirs(dir_path, exist_ok=True)
+        for i in range(4,5):
+            print(f"\n\n--- Running k_slots {k_slots}, trial {i + 1}/5 ---")
+            main(
+                batch_size=4,
+                n_iterations=10,
+                path=f"{dir_path}/trial_{i + 1}.csv",
+                k_slots=k_slots,
+                saasbo=True,
+            )
+
+    # test various k_slots (BO)
+    k_slots_list = [8,16,32]
+    for k_slots in k_slots_list:
+        dir_path = f"./data/scratch/bo_k_slots_{k_slots}"
+        os.makedirs(dir_path, exist_ok=True)
+        for i in range(4,5):
+            print(f"\n\n--- Running k_slots {k_slots}, trial {i + 1}/5 ---")
+            main(
+                batch_size=4,
+                n_iterations=10,
+                path=f"{dir_path}/trial_{i + 1}.csv",
+                k_slots=k_slots,
+                saasbo=False,
+            )
 
     print("All experiments completed.")

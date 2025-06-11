@@ -1,3 +1,7 @@
+# Scheduling of Distributed LLM Serving on Heterogeneous GPUs
+# Nathan Rignall
+# Main Divider - Used to generate islands and evaluate configurations using Bayesian Optimization (outer loop)
+
 import numpy as np
 import os
 import pandas as pd
@@ -21,7 +25,7 @@ import divider
 # --- Define constants ---
 GPU_TYPES = ["DGX-B300", "GB300-NVL72", "H200", "H800", "H20"]
 
-# --- Initialization ---
+# --- Create packer and evaluator instances ---
 sys_pack = packer.Packer(gpu_types=GPU_TYPES)
 
 # converation AzureLLM
@@ -29,10 +33,10 @@ trace_pdf = evaluator.load_trace_pdf("traces/conv_context_tokens_hist.csv")
 decode_len_avg = 106
 decode_len_max = 1500
 
-# code AzureLLM
-trace_pdf = evaluator.load_trace_pdf("traces/code_context_tokens_hist.csv")
-decode_len_avg = 22
-decode_len_max = 5000
+# # code AzureLLM
+# trace_pdf = evaluator.load_trace_pdf("traces/code_context_tokens_hist.csv")
+# decode_len_avg = 22
+# decode_len_max = 5000
 
 # --- Define the search space ---
 def create_search_space(gpu_types: list[str], inventory: dict[str, int], min_island_size: int, skew_exponent_range=(-5.0, 5.0)) -> SearchSpace:
@@ -95,18 +99,16 @@ def eval_config_outer(params_dict, inventory, min_island_size):
 
         for size_val in island_sizes_for_type:
             if size_val > 0:
-                # Using the MockEvaluator.Island which handles its own ID generation
                 island = evaluator.Island(gpu_type=gpu_type, size=size_val)
                 all_generated_islands.append(island)
 
     if not all_generated_islands:
         print("ERROR - No islands were generated. Configuration rejected.")
-        10.0 # Reject this configuration
+        return 10.0 # Reject this configuration
 
     islands_dict = {island.id: island for island in all_generated_islands}
     
-    # print(f"Calling packer.solve_linear with {len(islands_dict)} islands...")
-    model_solution, prefill_throughput, decode_throughput, delta, objective_val = sys_pack.solve_linear(
+    _, prefill_throughput, decode_throughput, _, _ = sys_pack.solve_linear(
         islands_dict, trace_pdf, decode_len_avg, decode_len_max, resolution=100, print_debug=False # Set print_debug as needed
     )
 
@@ -121,7 +123,6 @@ def eval_config_outer(params_dict, inventory, min_island_size):
 
 # --- Create the experiment ---
 def create_experiment(search_space, inventory, min_island_size) -> Experiment:
-    # --- Optimization config ---
     optimization_config = OptimizationConfig(
         objective=Objective(
             metric=GenericNoisyFunctionMetric(
@@ -134,9 +135,8 @@ def create_experiment(search_space, inventory, min_island_size) -> Experiment:
         ),
     )
 
-    # --- Build experiment ---
     experiment = Experiment(
-        name="gpu_island_scheduler_v2_divider",
+        name="gpu_island_scheduler_divider",
         search_space=search_space,
         optimization_config=optimization_config,
         runner=SyntheticRunner(),
@@ -145,9 +145,6 @@ def create_experiment(search_space, inventory, min_island_size) -> Experiment:
 
 # --- Initialization ---
 def generate_okay_configs(n_configs: int = 1, search_space_obj=None):
-    if search_space_obj is None:
-        raise ValueError("search_space_obj must be provided to generate_okay_configs_v2")
-
     configs = []
     for i in range(n_configs):
         cfg = {}
@@ -181,14 +178,10 @@ def generate_okay_configs(n_configs: int = 1, search_space_obj=None):
 
 def add_initial_arms_to_experiment(exp_obj, initial_params_list):
     for idx, params_dict in enumerate(initial_params_list):
-        if not params_dict:
-            print(f"Skipping empty initial parameter set {idx}.")
-            continue
         arm = Arm(name=f"warm_start_{idx}", parameters=params_dict)
-        # For SyntheticRunner, new_trial().add_arm().run() is typical
         trial = exp_obj.new_trial()
         trial.add_arm(arm)
-        trial.run() # This will call eval_config_outer
+        trial.run()
 
 # --- Main function ---
 def main(inventory: dict[str, int], batch_size: int = 5, n_iterations: int = 20, min_island_size: int = 2, path: str = "./data/scratch/gpu_island_scheduler_results.csv"):
@@ -198,16 +191,16 @@ def main(inventory: dict[str, int], batch_size: int = 5, n_iterations: int = 20,
     # add first timestamp
     time_df.loc[len(time_df)] = [0, pd.Timestamp.now()]
 
-    # Create search space and experiment
+    # create search space and experiment
     search_space = create_search_space(GPU_TYPES, inventory, min_island_size)
     experiment = create_experiment(search_space, inventory, min_island_size)
 
-    # Generate initial configurations
+    # generate initial configurations
     initial_parameters_list = generate_okay_configs(
         n_configs=5, search_space_obj=experiment.search_space
     )
 
-    # Add initial arms to the experiment
+    # add initial arms to the experiment
     if initial_parameters_list:
         add_initial_arms_to_experiment(experiment, initial_parameters_list)
         data = experiment.fetch_data()
@@ -216,8 +209,6 @@ def main(inventory: dict[str, int], batch_size: int = 5, n_iterations: int = 20,
     else:
         print("No initial parameters generated. Starting BO without warm-start.")
         data = Data()
-
-    # --- BO loop ---
 
     # Configure the Standard GP model
     surrogate = Surrogate(
@@ -236,27 +227,27 @@ def main(inventory: dict[str, int], batch_size: int = 5, n_iterations: int = 20,
             surrogate=surrogate,
         )
 
-        # Generate next candidates
+        # generate new arms
         generator_run = model.gen(n=batch_size)
         trial = experiment.new_batch_trial(generator_run=generator_run)
         trial.run()
 
-        # Update data
+        # fetch new data
         new_data = trial.fetch_data()
         for _, row in new_data.df.iterrows():
             print(f"Iteration {i+1}, arm {row['arm_name']}: rho_max = {row['mean']}")
         data = Data.from_multiple_data([data, new_data])
 
-        # Print intermediate results
+        # print intermediate results
         print("\nIntermediate results:")
         print(data.df[["arm_name", "mean"]].sort_values(by="mean"))
         print("\n")
 
-        # Print best roh
+        # print best arm so far
         best = data.df.loc[data.df["mean"].idxmin()]
         print(f"Best rho_max: {best['mean']} for arm {best['arm_name']}")
 
-        # Add timestamp for this trial
+        # add timestamp for this trial
         time_df.loc[len(time_df)] = [trial.index, pd.Timestamp.now()]
 
     # --- Final results ---
@@ -269,101 +260,92 @@ def main(inventory: dict[str, int], batch_size: int = 5, n_iterations: int = 20,
     df.to_csv(path, index=False)
     time_df.to_csv(path.replace(".csv", "_timestamps.csv"), index=False)
 
-# uncomment to execute experiment
+# main experiments
 if __name__ == "__main__":
-    # #test various batch sizes
-    # batch_sizes = [2,4,8,16]
-    # for batch in batch_sizes:
-    #     dir_path = f"./data/scratch/{batch}_20_10"
-    #     os.makedirs(dir_path, exist_ok=True)
-    #     for i in range(10):
-    #         print(f"\n\n--- Running batch size {batch}, trial {i + 1}/10 ---")
-    #         main(
-    #             batch_size=batch,
-    #             n_iterations=20,
-    #             path=f"{dir_path}/trial_{i + 1}.csv",
-    #         )
+    #test various batch sizes
+    batch_sizes = [2,4,8,16]
+    for batch in batch_sizes:
+        dir_path = f"./data/scratch/{batch}_20_10"
+        os.makedirs(dir_path, exist_ok=True)
+        for i in range(10):
+            print(f"\n\n--- Running batch size {batch}, trial {i + 1}/10 ---")
+            main(
+                inventory={"DGX-B300": 128, "H200": 256},
+                batch_size=batch,
+                n_iterations=20,
+                path=f"{dir_path}/trial_{i + 1}.csv",
+            )
 
-    # # test various skew exponent ranges
-    # skew_ranges = [(-5.0, 5.0), (-3.0, 3.0), (-1.0, 1.0)]
-    # for skew_range in skew_ranges:
-    #     dir_path = f"./data/scratch/skew_{skew_range[0]}_{skew_range[1]}"
-    #     os.makedirs(dir_path, exist_ok=True)
-    #     for i in range(10):
-    #         print(f"\n\n--- Running skew range {skew_range}, trial {i + 1}/10 ---")
-    #         main(
-    #             batch_size=8,
-    #             n_iterations=20,
-    #             path=f"{dir_path}/trial_{i + 1}.csv",
-    #         )
+    # test various skew exponent ranges
+    skew_ranges = [(-5.0, 5.0), (-3.0, 3.0), (-1.0, 1.0)]
+    for skew_range in skew_ranges:
+        dir_path = f"./data/scratch/skew_{skew_range[0]}_{skew_range[1]}"
+        os.makedirs(dir_path, exist_ok=True)
+        for i in range(10):
+            print(f"\n\n--- Running skew range {skew_range}, trial {i + 1}/10 ---")
+            main(
+                inventory={"DGX-B300": 128, "H200": 256},
+                batch_size=8,
+                n_iterations=20,
+                path=f"{dir_path}/trial_{i + 1}.csv",
+            )
 
-    # # test various min island sizes
-    # min_island_sizes = [8, 4, 2]
-    # for min_island_size in min_island_sizes:
-    #     dir_path = f"./data/scratch/min_island_size_{min_island_size}"
-    #     os.makedirs(dir_path, exist_ok=True)
-    #     for i in range(10):
-    #         print(f"\n\n--- Running min island size {min_island_size}, trial {i + 1}/10 ---")
-    #         main(
-    #             batch_size=8,
-    #             n_iterations=20,
-    #             min_island_size=min_island_size,
-    #             path=f"{dir_path}/trial_{i + 1}.csv",
-    #         )
+    # test various min island sizes
+    min_island_sizes = [8, 4, 2]
+    for min_island_size in min_island_sizes:
+        dir_path = f"./data/scratch/min_island_size_{min_island_size}"
+        os.makedirs(dir_path, exist_ok=True)
+        for i in range(10):
+            print(f"\n\n--- Running min island size {min_island_size}, trial {i + 1}/10 ---")
+            main(
+                inventory={"DGX-B300": 128, "H200": 256},
+                batch_size=8,
+                n_iterations=20,
+                min_island_size=min_island_size,
+                path=f"{dir_path}/trial_{i + 1}.csv",
+            )
 
-    # test inventory configurations
-    # inventory_configs = [
-    #     {"DGX-B300": 128, "H200": 256},
-    #     {"GB300-NVL72": 64, "H800": 128},
-    #     {"H20": 128, "H200": 128},
-    #     {"DGX-B300": 64, "GB300-NVL72": 32, "H800": 16},
-    #     {"DGX-B300": 64, "GB300-NVL72": 64, "H200": 256, "H800": 128, "H20": 256},
-    # ]
+    inventory_configs = [
+        {"H200": 64, "H800": 64, "H20": 128},
+        {"H200": 32, "H800": 128, "H20": 128},
+        {"H200": 128},
+        {"H800": 256}
+    ]
 
-    # # azure conversation 
-    # for inventory in inventory_configs:
-    #     dir_path = f"./data/scratch/azure_conv_{'_'.join(f'{k}-{v}' for k, v in inventory.items())}"
-    #     os.makedirs(dir_path, exist_ok=True)
-    #     for i in range(10):
-    #         print(f"\n\n--- Running inventory {inventory}, trial {i + 1}/10 ---")
-    #         main(
-    #             inventory=inventory,
-    #             batch_size=8,
-    #             n_iterations=15,
-    #             path=f"{dir_path}/trial_{i + 1}.csv",
-    #         )
+    # converation AzureLLM
+    trace_pdf = evaluator.load_trace_pdf("traces/conv_context_tokens_hist.csv")
+    decode_len_avg = 106
+    decode_len_max = 1500
 
-    # inventory_configs = [
-    #     {"H200": 64, "H800": 64, "H20": 128},
-    #     {"H200": 32, "H800": 128, "H20": 128},
-    #     {"H200": 128},
-    #     {"H800": 256}
-    # ]
+    # azure conversation 
+    for inventory in inventory_configs:
+        dir_path = f"./data/scratch/het_azure_conv_{'_'.join(f'{k}-{v}' for k, v in inventory.items())}"
+        os.makedirs(dir_path, exist_ok=True)
+        for i in range(5):
+            print(f"\n\n--- Running inventory {inventory}, trial {i + 1}/10 ---")
+            main(
+                inventory=inventory,
+                batch_size=16,
+                n_iterations=15,
+                path=f"{dir_path}/trial_{i + 1}.csv",
+            )
 
-    # # azure conversation 
-    # for inventory in inventory_configs:
-    #     dir_path = f"./data/scratch/het_azure_conv_{'_'.join(f'{k}-{v}' for k, v in inventory.items())}"
-    #     os.makedirs(dir_path, exist_ok=True)
-    #     for i in range(5):
-    #         print(f"\n\n--- Running inventory {inventory}, trial {i + 1}/10 ---")
-    #         main(
-    #             inventory=inventory,
-    #             batch_size=16,
-    #             n_iterations=15,
-    #             path=f"{dir_path}/trial_{i + 1}.csv",
-    #         )
+    # # code AzureLLM
+    trace_pdf = evaluator.load_trace_pdf("traces/code_context_tokens_hist.csv")
+    decode_len_avg = 22
+    decode_len_max = 5000
 
-    # # azure code 
-    # for inventory in inventory_configs:
-    #     dir_path = f"./data/scratch/het_azure_code_{'_'.join(f'{k}-{v}' for k, v in inventory.items())}"
-    #     os.makedirs(dir_path, exist_ok=True)
-    #     for i in range(5):
-    #         print(f"\n\n--- Running inventory {inventory}, trial {i + 1}/10 ---")
-    #         main(
-    #             inventory=inventory,
-    #             batch_size=16,
-    #             n_iterations=15,
-    #             path=f"{dir_path}/trial_{i + 1}.csv",
-    #         )
+    # azure code 
+    for inventory in inventory_configs:
+        dir_path = f"./data/scratch/het_azure_code_{'_'.join(f'{k}-{v}' for k, v in inventory.items())}"
+        os.makedirs(dir_path, exist_ok=True)
+        for i in range(5):
+            print(f"\n\n--- Running inventory {inventory}, trial {i + 1}/10 ---")
+            main(
+                inventory=inventory,
+                batch_size=16,
+                n_iterations=15,
+                path=f"{dir_path}/trial_{i + 1}.csv",
+            )
 
     print("All experiments completed.")
